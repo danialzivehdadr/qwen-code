@@ -1,0 +1,430 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { act, createRef, type RefObject } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import type { Message } from '../adapters/types';
+import { I18nProvider } from '../i18n';
+
+// Mock the App context and the heavy row children so this test exercises only
+// MessageList's own collapse + deferred-scroll logic, not the whole render tree.
+vi.mock('../App', async () => {
+  const { createContext } = await import('react');
+  return { CompactModeContext: createContext(false) };
+});
+vi.mock('./MessageItem', async () => {
+  const React = await import('react');
+  return {
+    MessageItem: ({
+      message,
+      showAssistantActions,
+    }: {
+      message: Message;
+      showAssistantActions?: boolean;
+    }) =>
+      React.createElement('div', {
+        'data-testid': `msg-${message.id}`,
+        'data-assistant-actions': String(Boolean(showAssistantActions)),
+      }),
+  };
+});
+vi.mock('./messages/tools/ParallelAgentsGroup', () => ({
+  ParallelAgentsGroup: () => null,
+}));
+vi.mock('./messages/ToolApproval', () => ({ ToolApproval: () => null }));
+vi.mock('./messages/AskUserQuestion', () => ({ AskUserQuestion: () => null }));
+
+const { MessageList } = await import('./MessageList');
+type MessageListHandle = import('./MessageList').MessageListHandle;
+
+(
+  globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
+).IS_REACT_ACT_ENVIRONMENT = true;
+
+// jsdom provides neither ResizeObserver (MessageList's resize guard) nor a real
+// scrollIntoView (the non-virtual scroll path) — stub both.
+class ResizeObserverStub {
+  constructor(private readonly callback: ResizeObserverCallback) {}
+  observe() {
+    this.callback([], this as unknown as ResizeObserver);
+  }
+  unobserve() {}
+  disconnect() {}
+}
+(globalThis as { ResizeObserver?: unknown }).ResizeObserver ??=
+  ResizeObserverStub;
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
+
+const mounted: Array<{ root: Root; container: HTMLElement }> = [];
+afterEach(() => {
+  for (const { root, container } of mounted.splice(0)) {
+    act(() => root.unmount());
+    container.remove();
+  }
+  vi.useRealTimers();
+});
+
+type UserMessage = Extract<Message, { role: 'user' }>;
+type ToolGroupMessage = Extract<Message, { role: 'tool_group' }>;
+type AssistantMessage = Extract<Message, { role: 'assistant' }>;
+type ThinkingMessage = Extract<Message, { role: 'thinking' }>;
+type PlanMessage = Extract<Message, { role: 'plan' }>;
+
+const userMsg = (id: string): UserMessage => ({
+  id,
+  role: 'user',
+  content: 'q',
+});
+const userShellMsg = (
+  id: string,
+): Extract<Message, { role: 'user_shell' }> => ({
+  id,
+  role: 'user_shell',
+  command: 'npm test',
+});
+const toolMsg = (id: string): ToolGroupMessage => ({
+  id,
+  role: 'tool_group',
+  tools: [{ callId: `call-${id}`, toolName: 'Read', status: 'completed' }],
+});
+const asstMsg = (id: string): AssistantMessage => ({
+  id,
+  role: 'assistant',
+  content: 'answer',
+});
+const thinkingMsg = (id: string): ThinkingMessage => ({
+  id,
+  role: 'thinking',
+  content: 'thinking',
+});
+const planMsg = (id: string): PlanMessage => ({
+  id,
+  role: 'plan',
+  todos: [{ id: 'todo-1', content: 'step one', status: 'pending' }],
+});
+
+function mount(
+  messages: Message[],
+  ref?: RefObject<MessageListHandle | null>,
+  opts: { isResponding?: boolean } = {},
+): HTMLElement {
+  const container = document.createElement('div');
+  document.body.appendChild(container);
+  const root = createRoot(container);
+  act(() => {
+    root.render(
+      <I18nProvider language="en">
+        <MessageList
+          ref={ref}
+          messages={messages}
+          pendingApproval={null}
+          isResponding={opts.isResponding}
+          shellOutputMaxLines={50}
+        />
+      </I18nProvider>,
+    );
+  });
+  mounted.push({ root, container });
+  return container;
+}
+
+const has = (c: HTMLElement, id: string) =>
+  c.querySelector(`[data-testid="msg-${id}"]`) !== null;
+const assistantActions = (c: HTMLElement, id: string) =>
+  c
+    .querySelector(`[data-testid="msg-${id}"]`)
+    ?.getAttribute('data-assistant-actions');
+const isCollapsed = (c: HTMLElement, id: string) =>
+  c
+    .querySelector(`[data-testid="msg-${id}"]`)
+    ?.closest('[data-collapsed="true"]') !== null;
+const queryToggle = (c: HTMLElement, turnId: string) =>
+  c.querySelector(`[data-testid="toggle-${turnId}"]`) as HTMLElement | null;
+const toggle = (c: HTMLElement, turnId: string) =>
+  queryToggle(c, turnId) as HTMLElement;
+const toggleRow = (c: HTMLElement, turnId: string) =>
+  toggle(c, turnId).closest('[role="button"]') as HTMLElement;
+const click = (el: Element) =>
+  act(() => el.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+const nextFrame = () =>
+  act(
+    () =>
+      new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+  );
+const mockMessageListWidth = (width: number) =>
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+    width,
+    height: 600,
+    top: 0,
+    right: width,
+    bottom: 600,
+    left: 0,
+    x: 0,
+    y: 0,
+    toJSON: () => ({}),
+  });
+
+describe('MessageList — turn collapse (DOM)', () => {
+  it('collapses a completed turn: hides the step, keeps prompt + answer, shows the toggle', () => {
+    const c = mount([userMsg('u1'), toolMsg('g1'), asstMsg('a1')]);
+    expect(has(c, 'u1')).toBe(true);
+    expect(has(c, 'a1')).toBe(true);
+    expect(isCollapsed(c, 'g1')).toBe(true);
+    expect(toggleRow(c, 'u1').getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('renders collapse metrics in the standalone turn row', () => {
+    const c = mount([
+      { ...userMsg('u1'), timestamp: 1_000 },
+      { ...toolMsg('g1'), timestamp: 2_000 },
+      {
+        id: 't1',
+        role: 'thinking',
+        content: 'checking the tool result',
+        timestamp: 2_500,
+      },
+      {
+        ...asstMsg('a1'),
+        timestamp: 13_400,
+        usage: { inputTokens: 3100, outputTokens: 5100, cachedTokens: 2800 },
+      },
+    ]);
+    const text = c.textContent ?? '';
+    expect(text).toContain('Processed');
+    expect(text).toContain('13s');
+    expect(text).toContain('↑3.1k (2.8k cached, 90%) ↓5.1k');
+    expect(text).toContain('1 tool call');
+    expect(text).toContain('1 thought');
+    expect(text).not.toContain('1 step');
+    expect(text.indexOf('↓5.1k')).toBeLessThan(text.indexOf('1 tool call'));
+  });
+
+  it('renders step-less metrics without a toggle', () => {
+    const c = mount([
+      { ...userMsg('u1'), timestamp: 1_000 },
+      {
+        ...asstMsg('a1'),
+        timestamp: 1_900,
+        usage: { inputTokens: 1200, outputTokens: 45 },
+      },
+    ]);
+    const text = c.textContent ?? '';
+    expect(queryToggle(c, 'u1')).toBeNull();
+    expect(text).toContain('Processed 1s');
+    expect(text).toContain('↑1.2k ↓45');
+    expect(text).not.toContain('step');
+  });
+
+  it('omits elapsed-only completed metrics when there is no toggle', () => {
+    const c = mount([
+      { ...userMsg('u1'), timestamp: 1_000 },
+      { ...asstMsg('a1'), timestamp: 13_400 },
+    ]);
+    const text = c.textContent ?? '';
+    expect(queryToggle(c, 'u1')).toBeNull();
+    expect(text).not.toContain('Processed');
+    expect(text).not.toContain('13s');
+  });
+
+  it('shows live elapsed time for a running step-less turn', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const c = mount([{ ...userMsg('u1'), timestamp: 7_600 }], undefined, {
+      isResponding: true,
+    });
+    expect(queryToggle(c, 'u1')).toBeNull();
+    expect(c.textContent).toContain('Processing 3s');
+  });
+
+  it('toggle round-trip reveals then re-hides the step', () => {
+    const c = mount([userMsg('u1'), toolMsg('g1'), asstMsg('a1')]);
+    click(toggle(c, 'u1'));
+    expect(has(c, 'g1')).toBe(true);
+    expect(isCollapsed(c, 'g1')).toBe(false);
+    expect(toggleRow(c, 'u1').getAttribute('aria-expanded')).toBe('true');
+    click(toggle(c, 'u1'));
+    expect(isCollapsed(c, 'g1')).toBe(true);
+  });
+
+  it('renders the session timeline in the left gutter without expanding turns', async () => {
+    const rectSpy = mockMessageListWidth(1200);
+    const c = mount([
+      userMsg('u1'),
+      thinkingMsg('think1'),
+      asstMsg('mid1'),
+      toolMsg('g1'),
+      planMsg('plan1'),
+      asstMsg('a1'),
+      userMsg('u2'),
+      asstMsg('a2'),
+    ]);
+    await nextFrame();
+
+    const timeline = c.querySelector('[data-testid="session-timeline"]');
+    expect(timeline).not.toBeNull();
+    const entries = Array.from(
+      c.querySelectorAll('[data-testid="session-timeline-entry"]'),
+    );
+    expect(entries.map((entry) => entry.getAttribute('data-turn-id'))).toEqual([
+      'u1',
+      'u2',
+    ]);
+    expect(entries[0]?.getAttribute('data-node-kinds')).toBe(
+      'thought,commentary,tool,plan',
+    );
+    const details = Array.from(
+      c.querySelectorAll('[data-testid="session-timeline-detail"]'),
+    );
+    expect(details).toHaveLength(2);
+    expect(details[0]?.getAttribute('data-detail')).toContain(
+      'thinking · answer · 1 tool call · plan update',
+    );
+    const buttons = Array.from(
+      c.querySelectorAll<HTMLButtonElement>(
+        '[data-testid="session-timeline-entry"] button',
+      ),
+    );
+    expect(buttons[0]?.getAttribute('aria-label')).toBe(
+      'Turn 1: q. Current turn',
+    );
+    expect(buttons[0]?.getAttribute('title')).toContain('thinking');
+    expect(entries[0]?.getAttribute('data-in-current-range')).toBe('true');
+    expect(entries[1]?.getAttribute('data-in-current-range')).toBe('true');
+    expect(
+      c.querySelector('[data-testid="session-timeline-range"]'),
+    ).toBeNull();
+    expect(isCollapsed(c, 'g1')).toBe(true);
+    expect(c.querySelector('[data-testid="turn-timeline-row"]')).toBeNull();
+    rectSpy.mockRestore();
+  });
+
+  it('clicks a session timeline entry to jump to its turn', async () => {
+    const rectSpy = mockMessageListWidth(1200);
+    const scrollIntoView = vi
+      .spyOn(Element.prototype, 'scrollIntoView')
+      .mockImplementation(() => {});
+    const c = mount([
+      userMsg('u1'),
+      asstMsg('a1'),
+      userMsg('u2'),
+      asstMsg('a2'),
+    ]);
+    await nextFrame();
+
+    const secondEntryButton = c.querySelector<HTMLButtonElement>(
+      '[data-turn-id="u2"] button',
+    );
+    expect(secondEntryButton).not.toBeNull();
+    act(() => {
+      secondEntryButton?.dispatchEvent(
+        new MouseEvent('click', { bubbles: true }),
+      );
+    });
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'center' });
+    scrollIntoView.mockRestore();
+    rectSpy.mockRestore();
+  });
+
+  it('hides the session timeline when the message list is narrow', async () => {
+    const rectSpy = mockMessageListWidth(1000);
+
+    const c = mount([
+      userMsg('u1'),
+      asstMsg('a1'),
+      userMsg('u2'),
+      asstMsg('a2'),
+    ]);
+    await nextFrame();
+
+    expect(c.querySelector('[data-testid="session-timeline"]')).toBeNull();
+    rectSpy.mockRestore();
+  });
+
+  it('hides the session timeline when the message list has no width', async () => {
+    const rectSpy = mockMessageListWidth(0);
+
+    const c = mount([
+      userMsg('u1'),
+      asstMsg('a1'),
+      userMsg('u2'),
+      asstMsg('a2'),
+    ]);
+    await nextFrame();
+
+    expect(c.querySelector('[data-testid="session-timeline"]')).toBeNull();
+    rectSpy.mockRestore();
+  });
+
+  it('scrollToMessage auto-expands the collapsed turn that holds the target', () => {
+    const ref = createRef<MessageListHandle>();
+    const c = mount([userMsg('u1'), toolMsg('g1'), asstMsg('a1')], ref);
+    expect(isCollapsed(c, 'g1')).toBe(true);
+    let found = false;
+    act(() => {
+      found = ref.current!.scrollToMessage('g1', 'call-g1');
+    });
+    expect(found).toBe(true);
+    expect(has(c, 'g1')).toBe(true);
+    expect(isCollapsed(c, 'g1')).toBe(false);
+  });
+
+  it('smooth-scrolls the page when a new chat prompt appears', () => {
+    const scrollTo = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      value: 1200,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      value: 600,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
+      configurable: true,
+      value: scrollTo,
+    });
+
+    mount([userMsg('u1')]);
+
+    expect(scrollTo).toHaveBeenCalledWith({
+      top: 1200,
+      behavior: 'smooth',
+    });
+  });
+
+  it('does not treat a user_shell row as a new chat prompt', () => {
+    const scrollTo = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      value: 1200,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      value: 600,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollTo', {
+      configurable: true,
+      value: scrollTo,
+    });
+
+    mount([userShellMsg('shell')]);
+
+    expect(scrollTo).not.toHaveBeenCalledWith({
+      top: 1200,
+      behavior: 'smooth',
+    });
+  });
+
+  it('shows assistant actions on the final answer of a user_shell turn', () => {
+    const c = mount([
+      userShellMsg('shell'),
+      asstMsg('mid'),
+      toolMsg('tool'),
+      asstMsg('a1'),
+    ]);
+
+    expect(assistantActions(c, 'mid')).toBe('false');
+    expect(assistantActions(c, 'a1')).toBe('true');
+  });
+});
