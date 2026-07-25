@@ -1,0 +1,246 @@
+/**
+ * @license
+ * Copyright 2026 Qwen Team
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+// `qwen review fetch-pr`: prepare a PR review's working state in a single
+// deterministic pass.
+//
+//   1. Clean any stale worktree / branch from a previously interrupted run
+//      so the new run starts fresh.
+//   2. `git fetch <remote> pull/<n>/head:qwen-review/pr-<n>` — pull the PR
+//      HEAD into a unique local ref (does not modify the user's working
+//      tree, unlike `gh pr checkout`).
+//   3. `gh pr view ...` to fetch metadata (head/base ref names, head SHA,
+//      diff stats, cross-repo flag).
+//   4. `git worktree add` to create an ephemeral worktree at
+//      `.qwen/tmp/review-pr-<n>` so subsequent steps can run in isolation.
+//   5. Emit a single JSON report describing the resulting state, which the
+//      LLM reads to drive the rest of Step 1.
+
+import type { CommandModule } from 'yargs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { writeStdoutLine, writeStderrLine } from '../../utils/stdioHelpers.js';
+import { ensureAuthenticated, gh } from './lib/gh.js';
+import { git, refExists } from './lib/git.js';
+import {
+  REVIEW_TMP_DIR,
+  anchoredPath,
+  reviewBranch,
+  worktreePath,
+} from './lib/paths.js';
+import { fetchReportPath, type FetchReport } from './lib/session.js';
+
+interface PrMetadata {
+  headRefName: string;
+  headRefOid: string;
+  baseRefName: string;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  isCrossRepository: boolean;
+}
+
+interface FetchPrArgs {
+  pr_number: string;
+  owner_repo: string;
+  remote: string;
+  out: string;
+  comment: boolean;
+}
+
+function tryRemove(action: () => void): void {
+  try {
+    action();
+  } catch {
+    /* idempotent — silent on missing target */
+  }
+}
+
+function cleanStale(prNumber: string): void {
+  const wt = worktreePath(prNumber);
+  if (existsSync(wt)) {
+    tryRemove(() =>
+      execFileSync('git', ['worktree', 'remove', wt, '--force'], {
+        stdio: 'pipe',
+      }),
+    );
+  }
+  const ref = reviewBranch(prNumber);
+  if (refExists(ref)) {
+    tryRemove(() =>
+      execFileSync('git', ['branch', '-D', ref], { stdio: 'pipe' }),
+    );
+  }
+}
+
+async function runFetchPr(args: FetchPrArgs): Promise<void> {
+  const {
+    pr_number: prNumber,
+    owner_repo: ownerRepo,
+    remote,
+    out,
+    comment,
+  } = args;
+
+  if (ownerRepo.indexOf('/') < 0) {
+    throw new Error('owner_repo must look like "owner/repo"');
+  }
+
+  ensureAuthenticated();
+
+  // 1. Clean any stale worktree / branch from an earlier run.
+  cleanStale(prNumber);
+
+  // 2. Fetch PR HEAD into a unique local ref.
+  const ref = reviewBranch(prNumber);
+  try {
+    git('fetch', remote, `pull/${prNumber}/head:${ref}`);
+  } catch (err) {
+    throw new Error(
+      `Failed to fetch PR #${prNumber} from remote "${remote}": ${(err as Error).message}`,
+    );
+  }
+  const fetchedSha = git('rev-parse', ref);
+
+  // 3. Fetch PR metadata via gh CLI. Cross-repo flag tells the LLM whether
+  //    to switch into lightweight mode.
+  let meta: PrMetadata;
+  try {
+    const json = gh(
+      'pr',
+      'view',
+      prNumber,
+      '--repo',
+      ownerRepo,
+      '--json',
+      'headRefName,headRefOid,baseRefName,additions,deletions,changedFiles,isCrossRepository',
+    );
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    // Runtime shape check so a future `gh` CLI schema change can't
+    // silently propagate `undefined` strings into the fetch report
+    // (e.g., `headRefOid: undefined` becomes the literal string
+    // `"undefined"` downstream, breaking the SHA-based incremental
+    // cache and presubmit's CI status query). Mirrors the
+    // `hasMinimalShape` defense the read side has in session.ts.
+    if (
+      typeof parsed['headRefName'] !== 'string' ||
+      typeof parsed['headRefOid'] !== 'string' ||
+      typeof parsed['baseRefName'] !== 'string' ||
+      typeof parsed['additions'] !== 'number' ||
+      typeof parsed['deletions'] !== 'number' ||
+      typeof parsed['changedFiles'] !== 'number' ||
+      typeof parsed['isCrossRepository'] !== 'boolean'
+    ) {
+      throw new Error(
+        `gh pr view returned unexpected JSON shape: ${JSON.stringify(parsed).slice(0, 200)}`,
+      );
+    }
+    meta = parsed as unknown as PrMetadata;
+  } catch (err) {
+    // Roll back the fetched ref so the next run starts clean.
+    tryRemove(() =>
+      execFileSync('git', ['branch', '-D', ref], { stdio: 'pipe' }),
+    );
+    throw new Error(
+      `Failed to fetch PR #${prNumber} metadata: ${(err as Error).message}`,
+    );
+  }
+
+  // 4. Create the ephemeral worktree.
+  const wt = worktreePath(prNumber);
+  try {
+    mkdirSync(dirname(wt), { recursive: true });
+    git('worktree', 'add', wt, ref);
+  } catch (err) {
+    tryRemove(() =>
+      execFileSync('git', ['branch', '-D', ref], { stdio: 'pipe' }),
+    );
+    throw new Error(
+      `Failed to create worktree at ${wt}: ${(err as Error).message}`,
+    );
+  }
+
+  // 5. Emit the report.
+  const result: FetchReport = {
+    prNumber,
+    ownerRepo,
+    remote,
+    ref,
+    fetchedSha,
+    worktreePath: wt,
+    baseRefName: meta.baseRefName,
+    headRefName: meta.headRefName,
+    isCrossRepository: meta.isCrossRepository,
+    diffStat: {
+      files: meta.changedFiles,
+      additions: meta.additions,
+      deletions: meta.deletions,
+    },
+    commentMode: !!comment,
+  };
+
+  // Anchor mkdirSync at projectRoot so the directory exists even when
+  // fetch-pr is invoked from a non-root cwd (`tmpFile` / `fetchReportPath`
+  // resolve absolute against projectRoot, so the relative-from-cwd
+  // mkdirSync would have created the wrong directory).
+  mkdirSync(anchoredPath(REVIEW_TMP_DIR), { recursive: true });
+  const outPath = anchoredPath(out);
+  const json = JSON.stringify(result, null, 2) + '\n';
+  writeFileSync(outPath, json, 'utf8');
+  // Also mirror to the canonical path so downstream subcommands can locate the
+  // session even when `--out` was given a non-canonical destination. When the
+  // caller already used the canonical path, this is a no-op overwrite of
+  // identical content.
+  const canonical = fetchReportPath(prNumber);
+  if (canonical !== outPath) {
+    writeFileSync(canonical, json, 'utf8');
+  }
+  writeStdoutLine(`Wrote fetch-pr report to ${outPath}`);
+  // Surface diff stats to stderr so a human running the command interactively
+  // sees something useful even without inspecting the JSON.
+  writeStderrLine(
+    `PR #${prNumber} (${ownerRepo}): ${meta.changedFiles} files, +${meta.additions}/-${meta.deletions}, base=${meta.baseRefName}, head=${meta.headRefName}`,
+  );
+}
+
+export const fetchPrCommand: CommandModule = {
+  command: 'fetch-pr <pr_number> <owner_repo>',
+  describe:
+    'Prepare a PR review worktree: clean stale state, fetch the PR HEAD, create a worktree, and write a JSON state report',
+  builder: (yargs) =>
+    yargs
+      .positional('pr_number', {
+        type: 'string',
+        demandOption: true,
+        describe: 'PR number',
+      })
+      .positional('owner_repo', {
+        type: 'string',
+        demandOption: true,
+        describe: 'GitHub "owner/repo"',
+      })
+      .option('remote', {
+        type: 'string',
+        default: 'origin',
+        describe:
+          'Git remote to fetch from (use "upstream" for fork-based workflows)',
+      })
+      .option('out', {
+        type: 'string',
+        demandOption: true,
+        describe: 'Output JSON path (will be overwritten)',
+      })
+      .option('comment', {
+        type: 'boolean',
+        default: false,
+        describe:
+          'Record that /review was invoked with --comment. Persisted in the JSON report so `qwen review autofix-gate` can deterministically skip Step 8 (autofix) without relying on the LLM driver to remember the flag.',
+      }),
+  handler: async (argv) => {
+    await runFetchPr(argv as unknown as FetchPrArgs);
+  },
+};
