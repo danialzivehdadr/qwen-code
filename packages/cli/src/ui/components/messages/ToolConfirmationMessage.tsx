@@ -1,0 +1,527 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type React from 'react';
+import { useEffect, useState } from 'react';
+import { Box, Text } from 'ink';
+import { DiffRenderer } from './DiffRenderer.js';
+import { RenderInline } from '../../utils/InlineMarkdownRenderer.js';
+import { MarkdownDisplay } from '../../utils/MarkdownDisplay.js';
+import type {
+  ToolCallConfirmationDetails,
+  ToolExecuteConfirmationDetails,
+  ToolMcpConfirmationDetails,
+  Config,
+  EditorType,
+} from '@qwen-code/qwen-code-core';
+import {
+  IdeClient,
+  ToolConfirmationOutcome,
+  buildHumanReadableRuleLabel,
+} from '@qwen-code/qwen-code-core';
+import type { RadioSelectItem } from '../shared/RadioButtonSelect.js';
+import { RadioButtonSelect } from '../shared/RadioButtonSelect.js';
+import { MaxSizedBox } from '../shared/MaxSizedBox.js';
+import { useKeypress } from '../../hooks/useKeypress.js';
+import { useSettings } from '../../contexts/SettingsContext.js';
+import { theme } from '../../semantic-colors.js';
+import { t } from '../../../i18n/index.js';
+import { AskUserQuestionDialog } from './AskUserQuestionDialog.js';
+
+// Cap the body height of inline subagent approval banners so a
+// multi-line command can't dominate the screen. MaxSizedBox renders
+// a "... N more lines" footer past this cap.
+const COMPACT_BODY_MAX_LINES = 5;
+
+export interface ToolConfirmationMessageProps {
+  confirmationDetails: ToolCallConfirmationDetails;
+  config: Config;
+  isFocused?: boolean;
+  availableTerminalHeight?: number;
+  contentWidth: number;
+  /**
+   * @deprecated The TUI display optimization made the compact layout
+   * the only rendering path; the prop is preserved as a no-op so
+   * external test fixtures keep working but is otherwise ignored.
+   */
+  compactMode?: boolean;
+}
+
+export const ToolConfirmationMessage: React.FC<
+  ToolConfirmationMessageProps
+> = ({
+  confirmationDetails,
+  config,
+  isFocused = true,
+  availableTerminalHeight,
+  contentWidth,
+}) => {
+  // Always-compact after the TUI display optimization: legacy spacing
+  // values are zero so the confirmation banner sits flush with the
+  // surrounding tool group rather than ballooning out with padding.
+  const compactMode = true;
+  const { onConfirm } = confirmationDetails;
+
+  const settings = useSettings();
+  const preferredEditor = settings.merged.general?.preferredEditor as
+    | EditorType
+    | undefined;
+
+  const [ideClient, setIdeClient] = useState<IdeClient | null>(null);
+  const [isDiffingEnabled, setIsDiffingEnabled] = useState(false);
+
+  useEffect(() => {
+    let isMounted = true;
+    if (config.getIdeMode()) {
+      const getIdeClient = async () => {
+        const client = await IdeClient.getInstance();
+        if (isMounted) {
+          setIdeClient(client);
+          setIsDiffingEnabled(client?.isDiffingEnabled() ?? false);
+        }
+      };
+      getIdeClient();
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [config]);
+
+  const handleConfirm = async (outcome: ToolConfirmationOutcome) => {
+    // Call onConfirm before resolving the IDE diff so that the CLI outcome
+    // (e.g. ProceedAlways) is processed first.  resolveDiffFromCli would
+    // otherwise trigger the scheduler's ideConfirmation .then() handler
+    // with ProceedOnce, racing with the intended CLI outcome.
+    onConfirm(outcome);
+
+    if (confirmationDetails.type === 'edit') {
+      if (config.getIdeMode() && isDiffingEnabled) {
+        const cliOutcome =
+          outcome === ToolConfirmationOutcome.Cancel ? 'rejected' : 'accepted';
+        await ideClient?.resolveDiffFromCli(
+          confirmationDetails.filePath,
+          cliOutcome,
+        );
+      }
+    }
+  };
+
+  const isTrustedFolder = config.isTrustedFolder();
+
+  useKeypress(
+    (key) => {
+      if (!isFocused) return;
+      if (key.name === 'escape' || (key.ctrl && key.name === 'c')) {
+        handleConfirm(ToolConfirmationOutcome.Cancel);
+      }
+    },
+    { isActive: isFocused },
+  );
+
+  const handleSelect = (item: ToolConfirmationOutcome) => handleConfirm(item);
+
+  let bodyContent: React.ReactNode | null = null; // Removed contextDisplay here
+  let question: string;
+
+  const options: Array<RadioSelectItem<ToolConfirmationOutcome>> = new Array<
+    RadioSelectItem<ToolConfirmationOutcome>
+  >();
+
+  // Body content is now the DiffRenderer, passing filename to it
+  // The bordered box is removed from here and handled within DiffRenderer
+
+  function availableBodyContentHeight() {
+    if (options.length === 0) {
+      // This should not happen in practice as options are always added before this is called.
+      throw new Error('Options not provided for confirmation message');
+    }
+
+    if (availableTerminalHeight === undefined) {
+      return undefined;
+    }
+
+    // Calculate the vertical space (in lines) consumed by UI elements
+    // surrounding the main body content. Compact mode drops outer padding
+    // and inter-section margins. The option list reserves the actual
+    // option count (capped at `MAX_VISIBLE_OPTIONS`) — a fixed 3 here
+    // under-reserved when MCP / always-allow variants pushed the list to
+    // 4+ entries, letting the body content overflow the available
+    // terminal space.
+    const MAX_VISIBLE_OPTIONS = 6;
+    const PADDING_OUTER_Y = compactMode ? 0 : 2;
+    const MARGIN_BODY_BOTTOM = compactMode ? 0 : 1;
+    const HEIGHT_QUESTION = 1;
+    const MARGIN_QUESTION_BOTTOM = compactMode ? 0 : 1;
+    const HEIGHT_OPTIONS = Math.min(options.length, MAX_VISIBLE_OPTIONS);
+
+    const surroundingElementsHeight =
+      PADDING_OUTER_Y +
+      MARGIN_BODY_BOTTOM +
+      HEIGHT_QUESTION +
+      MARGIN_QUESTION_BOTTOM +
+      HEIGHT_OPTIONS;
+    return Math.max(availableTerminalHeight - surroundingElementsHeight, 1);
+  }
+
+  if (confirmationDetails.type === 'edit') {
+    if (confirmationDetails.isModifying) {
+      return (
+        <Box
+          minWidth="90%"
+          borderStyle="round"
+          borderColor={theme.border.default}
+          justifyContent="space-around"
+          padding={1}
+          overflow="hidden"
+        >
+          <Text color={theme.text.primary}>{t('Modify in progress:')} </Text>
+          <Text color={theme.status.success}>
+            {t('Save and close external editor to continue')}
+          </Text>
+        </Box>
+      );
+    }
+
+    question = t('Apply this change?');
+    options.push({
+      label: t('Yes, allow once'),
+      value: ToolConfirmationOutcome.ProceedOnce,
+      key: 'Yes, allow once',
+    });
+    if (isTrustedFolder) {
+      options.push({
+        label: t('Yes, allow always'),
+        value: ToolConfirmationOutcome.ProceedAlways,
+        key: 'Yes, allow always',
+      });
+    }
+    if ((!config.getIdeMode() || !isDiffingEnabled) && preferredEditor) {
+      options.push({
+        label: t('Modify with external editor'),
+        value: ToolConfirmationOutcome.ModifyWithEditor,
+        key: 'Modify with external editor',
+      });
+    }
+
+    options.push({
+      label: t('No, suggest changes (esc)'),
+      value: ToolConfirmationOutcome.Cancel,
+      key: 'No, suggest changes (esc)',
+    });
+
+    bodyContent = (
+      <DiffRenderer
+        diffContent={confirmationDetails.fileDiff}
+        filename={confirmationDetails.fileName}
+        availableTerminalHeight={availableBodyContentHeight()}
+        contentWidth={contentWidth}
+        settings={settings}
+      />
+    );
+  } else if (confirmationDetails.type === 'exec') {
+    const executionProps =
+      confirmationDetails as ToolExecuteConfirmationDetails;
+
+    question = t("Allow execution of: '{{command}}'?", {
+      command: executionProps.rootCommand,
+    });
+    options.push({
+      label: t('Yes, allow once'),
+      value: ToolConfirmationOutcome.ProceedOnce,
+      key: 'Yes, allow once',
+    });
+    if (isTrustedFolder && !confirmationDetails.hideAlwaysAllow) {
+      const friendlyLabel = executionProps.permissionRules?.length
+        ? ` ${buildHumanReadableRuleLabel(executionProps.permissionRules)}`
+        : '';
+      options.push({
+        label: friendlyLabel
+          ? t('Always allow {{action}} in this project', {
+              action: friendlyLabel.trim(),
+            })
+          : t('Always allow in this project'),
+        value: ToolConfirmationOutcome.ProceedAlwaysProject,
+        key: 'Always allow in this project',
+      });
+      options.push({
+        label: friendlyLabel
+          ? t('Always allow {{action}} for this user', {
+              action: friendlyLabel.trim(),
+            })
+          : t('Always allow for this user'),
+        value: ToolConfirmationOutcome.ProceedAlwaysUser,
+        key: 'Always allow for this user',
+      });
+    }
+    options.push({
+      label: t('No, suggest changes (esc)'),
+      value: ToolConfirmationOutcome.Cancel,
+      key: 'No, suggest changes (esc)',
+    });
+
+    let bodyContentHeight = availableBodyContentHeight();
+    if (bodyContentHeight !== undefined) {
+      bodyContentHeight -= 2; // Account for padding;
+    }
+    if (compactMode) {
+      bodyContentHeight = Math.min(
+        bodyContentHeight ?? COMPACT_BODY_MAX_LINES,
+        COMPACT_BODY_MAX_LINES,
+      );
+    }
+    bodyContent = (
+      <Box flexDirection="column">
+        <Box paddingX={1} marginLeft={1}>
+          <MaxSizedBox
+            maxHeight={bodyContentHeight}
+            maxWidth={Math.max(contentWidth, 1)}
+            overflowDirection="bottom"
+          >
+            <Box>
+              <Text color={theme.text.link}>{executionProps.command}</Text>
+            </Box>
+          </MaxSizedBox>
+        </Box>
+      </Box>
+    );
+  } else if (confirmationDetails.type === 'plan') {
+    const planProps = confirmationDetails;
+
+    question = planProps.title;
+    options.push({
+      key: 'restore-previous',
+      label: t('Yes, restore previous mode ({{mode}})', {
+        mode: planProps.prePlanMode ?? 'default',
+      }),
+      value: ToolConfirmationOutcome.RestorePrevious,
+    });
+    options.push({
+      key: 'proceed-always',
+      label: t('Yes, and auto-accept edits'),
+      value: ToolConfirmationOutcome.ProceedAlways,
+    });
+    options.push({
+      key: 'proceed-once',
+      label: t('Yes, and manually approve edits'),
+      value: ToolConfirmationOutcome.ProceedOnce,
+    });
+    options.push({
+      key: 'cancel',
+      label: t('No, keep planning (esc)'),
+      value: ToolConfirmationOutcome.Cancel,
+    });
+
+    const planHeight = compactMode
+      ? Math.min(
+          availableBodyContentHeight() ?? COMPACT_BODY_MAX_LINES,
+          COMPACT_BODY_MAX_LINES,
+        )
+      : availableBodyContentHeight();
+    bodyContent = (
+      <Box flexDirection="column" paddingX={1} marginLeft={1}>
+        <MarkdownDisplay
+          text={planProps.plan}
+          isPending={false}
+          availableTerminalHeight={planHeight}
+          contentWidth={contentWidth}
+        />
+      </Box>
+    );
+  } else if (confirmationDetails.type === 'info') {
+    const infoProps = confirmationDetails;
+    const displayUrls =
+      infoProps.urls &&
+      !(infoProps.urls.length === 1 && infoProps.urls[0] === infoProps.prompt);
+
+    question = t('Do you want to proceed?');
+    options.push({
+      label: t('Yes, allow once'),
+      value: ToolConfirmationOutcome.ProceedOnce,
+      key: 'Yes, allow once',
+    });
+    if (isTrustedFolder && !confirmationDetails.hideAlwaysAllow) {
+      const friendlyLabel =
+        'permissionRules' in infoProps &&
+        (infoProps as { permissionRules?: string[] }).permissionRules?.length
+          ? ` ${buildHumanReadableRuleLabel((infoProps as { permissionRules?: string[] }).permissionRules!)}`
+          : '';
+      options.push({
+        label: friendlyLabel
+          ? t('Always allow {{action}} in this project', {
+              action: friendlyLabel.trim(),
+            })
+          : t('Always allow in this project'),
+        value: ToolConfirmationOutcome.ProceedAlwaysProject,
+        key: 'Always allow in this project',
+      });
+      options.push({
+        label: friendlyLabel
+          ? t('Always allow {{action}} for this user', {
+              action: friendlyLabel.trim(),
+            })
+          : t('Always allow for this user'),
+        value: ToolConfirmationOutcome.ProceedAlwaysUser,
+        key: 'Always allow for this user',
+      });
+    }
+    options.push({
+      label: t('No, suggest changes (esc)'),
+      value: ToolConfirmationOutcome.Cancel,
+      key: 'No, suggest changes (esc)',
+    });
+
+    bodyContent = (
+      <Box flexDirection="column" paddingX={1} marginLeft={1}>
+        <Text color={theme.text.link}>
+          <RenderInline text={infoProps.prompt} textColor={theme.text.link} />
+        </Text>
+        {displayUrls && infoProps.urls && infoProps.urls.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text color={theme.text.primary}>{t('URLs to fetch:')}</Text>
+            {infoProps.urls.map((url) => (
+              <Text key={url}>
+                {' '}
+                - <RenderInline text={url} />
+              </Text>
+            ))}
+          </Box>
+        )}
+      </Box>
+    );
+  } else if (confirmationDetails.type === 'ask_user_question') {
+    // Use dedicated dialog for ask_user_question type
+    return (
+      <AskUserQuestionDialog
+        confirmationDetails={confirmationDetails}
+        isFocused={isFocused}
+        onConfirm={onConfirm}
+      />
+    );
+  } else {
+    // mcp tool confirmation
+    const mcpProps = confirmationDetails as ToolMcpConfirmationDetails;
+
+    bodyContent = (
+      <Box flexDirection="column" paddingX={1} marginLeft={1}>
+        <Text color={theme.text.link}>
+          {t('MCP Server: {{server}}', { server: mcpProps.serverName })}
+        </Text>
+        <Text color={theme.text.link}>
+          {t('Tool: {{tool}}', { tool: mcpProps.toolName })}
+        </Text>
+      </Box>
+    );
+
+    question = t(
+      'Allow execution of MCP tool "{{tool}}" from server "{{server}}"?',
+      {
+        tool: mcpProps.toolName,
+        server: mcpProps.serverName,
+      },
+    );
+    options.push({
+      label: t('Yes, allow once'),
+      value: ToolConfirmationOutcome.ProceedOnce,
+      key: 'Yes, allow once',
+    });
+    if (isTrustedFolder && !confirmationDetails.hideAlwaysAllow) {
+      const friendlyLabel = mcpProps.permissionRules?.length
+        ? ` ${buildHumanReadableRuleLabel(mcpProps.permissionRules)}`
+        : '';
+      options.push({
+        label: friendlyLabel
+          ? t('Always allow {{action}} in this project', {
+              action: friendlyLabel.trim(),
+            })
+          : t('Always allow in this project'),
+        value: ToolConfirmationOutcome.ProceedAlwaysProject,
+        key: 'Always allow in this project',
+      });
+      options.push({
+        label: friendlyLabel
+          ? t('Always allow {{action}} for this user', {
+              action: friendlyLabel.trim(),
+            })
+          : t('Always allow for this user'),
+        value: ToolConfirmationOutcome.ProceedAlwaysUser,
+        key: 'Always allow for this user',
+      });
+    }
+    options.push({
+      label: t('No, suggest changes (esc)'),
+      value: ToolConfirmationOutcome.Cancel,
+      key: 'No, suggest changes (esc)',
+    });
+  }
+
+  // For exec/mcp confirmations the type-specific question text would
+  // restate what the body already shows (the full command, or the labeled
+  // server + tool). Use the generic prompt so the question line acts as a
+  // body→options transition without duplicating information.
+  const renderedQuestion =
+    compactMode &&
+    (confirmationDetails.type === 'exec' || confirmationDetails.type === 'mcp')
+      ? t('Do you want to proceed?')
+      : question;
+
+  // Compact mode trims the option list to a fixed 3-option set (the
+  // project/user-scope "Always allow" variants would clutter the inline
+  // subagent banner) but still shows the per-type body and question so the
+  // parent knows what is being approved.
+  const renderedOptions: Array<RadioSelectItem<ToolConfirmationOutcome>> =
+    compactMode
+      ? [
+          {
+            key: 'proceed-once',
+            label: t('Yes, allow once'),
+            value: ToolConfirmationOutcome.ProceedOnce,
+          },
+          {
+            key: 'proceed-always',
+            label: t('Allow always'),
+            value: ToolConfirmationOutcome.ProceedAlways,
+          },
+          {
+            key: 'cancel',
+            label: t('No'),
+            value: ToolConfirmationOutcome.Cancel,
+          },
+        ]
+      : options;
+
+  // Compact mode strips outer padding, inter-section margins, and explicit
+  // width — the parent (SubagentExecutionRenderer) already provides those.
+  const outerPadding = compactMode ? 0 : 1;
+  const sectionMargin = compactMode ? 0 : 1;
+  const outerWidth = compactMode ? undefined : contentWidth;
+
+  return (
+    <Box flexDirection="column" padding={outerPadding} width={outerWidth}>
+      <Box
+        flexGrow={1}
+        flexShrink={1}
+        overflow="hidden"
+        marginBottom={sectionMargin}
+      >
+        {bodyContent}
+      </Box>
+
+      <Box marginBottom={sectionMargin} flexShrink={0}>
+        <Text color={theme.text.primary} wrap="truncate">
+          {renderedQuestion}
+        </Text>
+      </Box>
+
+      <Box flexShrink={0}>
+        <RadioButtonSelect
+          items={renderedOptions}
+          onSelect={handleSelect}
+          isFocused={isFocused}
+        />
+      </Box>
+    </Box>
+  );
+};
