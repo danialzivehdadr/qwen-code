@@ -1,0 +1,144 @@
+#!/usr/bin/env node
+/**
+ * @license
+ * Copyright 2026 Qwen Team
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/**
+ * render-review-prompt.cjs
+ *
+ * Render a Qwen Code review prompt template by substituting placeholders
+ * with file contents. Replaces the inline `node -e '...'` snippets that
+ * were spread across the preflight / LIGHT / STANDARD steps of
+ * `.github/workflows/qwen-code-pr-review.yml`.
+ *
+ * Supported placeholders (any subset may appear in the template):
+ *   <<<PR_CONTEXT>>>       — the PR's diff + metadata blob
+ *   <<<REVIEW_RULES_MD>>>  — contents of .qwen/review-rules.md
+ *
+ * Filename uses .cjs because the repo's root package.json sets
+ * "type": "module".
+ *
+ * Usage:
+ *   render-review-prompt.cjs <template> <output> \
+ *     [--context <file>] [--rules <file>]
+ *
+ * Notes:
+ *   - Missing placeholders in the template are silently ignored (i.e.
+ *     it's fine to render LIGHT-style prompts that don't include
+ *     <<<REVIEW_RULES_MD>>>; just don't pass --rules then).
+ *   - A `--context` or `--rules` flag passed but pointing at a missing
+ *     file is a hard error — the caller should have ensured the file
+ *     exists.
+ *   - Placeholder values are inserted verbatim. The template author is
+ *     responsible for safe surrounding markdown context (e.g., placing
+ *     the placeholder inside a clearly-bounded `## Section` block).
+ *
+ * Exit codes:
+ *   0  success
+ *   1  read/write failure
+ *   2  missing required positional args
+ */
+const fs = require('fs');
+
+// Thrown by parseArgs on bad input. main() catches it and exits 2;
+// tests can assert on it without spawning a subprocess.
+class ArgError extends Error {}
+
+function parseArgs(argv) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--context' || a === '--rules') {
+      const value = argv[i + 1];
+      // Reject a flag with no value (last arg, or followed by another
+      // flag) — otherwise a dropped path silently leaves the placeholder
+      // un-substituted in the rendered prompt.
+      if (value == null || value.startsWith('--')) {
+        throw new ArgError(`${a} requires a file path argument`);
+      }
+      flags[a.slice(2)] = value;
+      i++;
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, flags };
+}
+
+function readOrThrow(path, label) {
+  try {
+    return fs.readFileSync(path, 'utf8');
+  } catch (err) {
+    process.stderr.write(
+      `render-review-prompt: failed to read ${label} from ${path}: ${err.message}\n`,
+    );
+    process.exit(1);
+  }
+}
+
+function render(template, { context, rules }) {
+  let out = template;
+  // Use a function in replace() to avoid `$1` and other special replacement
+  // patterns being interpreted inside the substituted text.
+  //
+  // Substitute rules BEFORE context. The context blob embeds the
+  // attacker-controlled PR body, so it must be inserted last — once it is
+  // in, no further substitution pass scans it. If context went first, a
+  // PR body containing the literal `<<<REVIEW_RULES_MD>>>` would be hit by
+  // the rules pass, letting the PR forge a review-rules section in the
+  // prompt. (The rules file is trusted, so a `<<<PR_CONTEXT>>>` literal in
+  // it being substituted is harmless — but order it this way regardless.)
+  if (rules != null) {
+    out = out.replace(/<<<REVIEW_RULES_MD>>>/g, () => rules);
+  }
+  if (context != null) {
+    out = out.replace(/<<<PR_CONTEXT>>>/g, () => context);
+  }
+  return out;
+}
+
+function main() {
+  let positional;
+  let flags;
+  try {
+    ({ positional, flags } = parseArgs(process.argv.slice(2)));
+  } catch (err) {
+    if (err instanceof ArgError) {
+      process.stderr.write(`render-review-prompt: ${err.message}\n`);
+      process.exit(2);
+    }
+    throw err;
+  }
+  if (positional.length < 2) {
+    process.stderr.write(
+      'Usage: render-review-prompt.cjs <template> <output> ' +
+        '[--context <file>] [--rules <file>]\n',
+    );
+    process.exit(2);
+  }
+  const [templatePath, outputPath] = positional;
+  const template = readOrThrow(templatePath, 'template');
+  const context = flags.context ? readOrThrow(flags.context, 'context') : null;
+  const rules = flags.rules ? readOrThrow(flags.rules, 'rules') : null;
+  const rendered = render(template, { context, rules });
+  try {
+    fs.writeFileSync(outputPath, rendered);
+  } catch (err) {
+    process.stderr.write(
+      `render-review-prompt: failed to write ${outputPath}: ${err.message}\n`,
+    );
+    process.exit(1);
+  }
+  process.stderr.write(
+    `render-review-prompt: wrote ${rendered.length} char(s) to ${outputPath}\n`,
+  );
+}
+
+// Export for tests.
+module.exports = { render, parseArgs, ArgError };
+
+if (require.main === module) {
+  main();
+}
