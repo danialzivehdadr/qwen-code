@@ -1,0 +1,112 @@
+import { useConnection } from '@qwen-code/webui/daemon-react-sdk';
+import { useI18n } from '../i18n';
+import styles from './StatusBar.module.css';
+
+function getModeIndicator(
+  mode: string,
+  t: ReturnType<typeof useI18n>['t'],
+): { label: string; className: string } | null {
+  switch (mode) {
+    case 'default':
+      return { label: t('mode.default'), className: styles.modeDefault };
+    case 'plan':
+      return { label: t('mode.plan'), className: styles.modePlan };
+    case 'auto-edit':
+      return { label: t('mode.auto-edit'), className: styles.modeAutoEdit };
+    case 'auto':
+      return { label: t('mode.auto'), className: styles.modeAuto };
+    case 'yolo':
+      return { label: t('mode.yolo'), className: styles.modeYolo };
+    default:
+      // Only reached before a mode is known (e.g. while disconnected).
+      return null;
+  }
+}
+
+interface StatusBarProps {
+  escapeHint?: boolean;
+  /** Open the approval-mode picker so the mode can be chosen with the mouse. */
+  onSelectMode: () => void;
+  /** Open the model picker so the model can be chosen with the mouse. */
+  onSelectModel: () => void;
+}
+
+export function StatusBar({
+  escapeHint,
+  onSelectMode,
+  onSelectModel,
+}: StatusBarProps) {
+  const connection = useConnection();
+  const connected = connection.status === 'connected';
+  const currentModel = connection.currentModel ?? '';
+  const currentMode = connection.currentMode ?? '';
+  const tokenCount = connection.tokenCount ?? 0;
+  const contextWindow = connection.contextWindow ?? 0;
+  const { t } = useI18n();
+  const pct = contextWindow > 0 ? (tokenCount / contextWindow) * 100 : 0;
+  const pctDisplay = pct.toFixed(1);
+  const modeIndicator = getModeIndicator(currentMode, t);
+
+  return (
+    <div className={styles.bar}>
+      <div className={styles.left}>
+        {escapeHint ? (
+          <span className={styles.escapeHint}>{t('editor.escClearHint')}</span>
+        ) : modeIndicator ? (
+          // The hint advertises "click to switch", so the indicator is always
+          // a real button — never a non-interactive label. stopPropagation on
+          // both mousedown and touchstart keeps the trigger from counting as an
+          // "outside" press for the picker's own dismiss handler (it listens on
+          // exactly those two), so re-activating toggles cleanly on mouse and
+          // touch alike.
+          <button
+            type="button"
+            className={styles.modeButton}
+            onClick={onSelectMode}
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            title={t('mode.select')}
+            aria-haspopup="listbox"
+          >
+            <span className={`${styles.modeLabel} ${modeIndicator.className}`}>
+              {modeIndicator.label}
+            </span>
+            <span className={styles.modeHint}>{t('status.modeHint')}</span>
+          </button>
+        ) : (
+          <span>{t('status.shortcuts')}</span>
+        )}
+      </div>
+
+      <div className={styles.right}>
+        {!connected && (
+          <span className={styles.disconnected}>
+            {t('status.disconnected')}
+          </span>
+        )}
+        {currentModel && (
+          // Mirrors the mode indicator on the left: the model label is a
+          // button that opens the existing model picker. stopPropagation on
+          // mousedown/touchstart keeps the opening press from counting as an
+          // "outside" press for the picker's own dismiss handler.
+          <button
+            type="button"
+            className={styles.modelButton}
+            onClick={onSelectModel}
+            onMouseDown={(e) => e.stopPropagation()}
+            onTouchStart={(e) => e.stopPropagation()}
+            title={t('model.select')}
+            aria-haspopup="listbox"
+          >
+            <span className={styles.model}>{currentModel}</span>
+          </button>
+        )}
+        {contextWindow > 0 && tokenCount > 0 && (
+          <span className={styles.context}>
+            {t('status.contextUsed', { pct: pctDisplay })}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
