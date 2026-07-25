@@ -1,0 +1,8 @@
+**
+!dist/
+!dist/**
+../
+../../
+!LICENSE
+!NOTICES.txt
+!assets/
