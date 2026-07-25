@@ -1,0 +1,355 @@
+/**
+ * @license
+ * Copyright 2026 Qwen Team
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { describe, expect, it } from 'vitest';
+import { createInitialModelState, modelReducer } from './modelStore.js';
+import type { DesktopUserSettings } from '../api/client.js';
+
+describe('modelStore', () => {
+  it('tracks loaded session model and mode state', () => {
+    const state = modelReducer(createInitialModelState(), {
+      type: 'session_runtime_loaded',
+      models: {
+        currentModelId: 'openai/qwen-plus',
+        availableModels: [{ modelId: 'openai/qwen-plus', name: 'Qwen Plus' }],
+      },
+      modes: {
+        currentModeId: 'default',
+        availableModes: [
+          { id: 'default', name: 'Default', description: 'Ask first' },
+        ],
+      },
+    });
+
+    expect(state.models?.currentModelId).toBe('openai/qwen-plus');
+    expect(state.modes?.currentModeId).toBe('default');
+  });
+
+  it('applies socket model and mode updates to loaded state', () => {
+    const loaded = modelReducer(createInitialModelState(), {
+      type: 'session_runtime_loaded',
+      models: {
+        currentModelId: 'openai/qwen-plus',
+        availableModels: [
+          { modelId: 'openai/qwen-plus', name: 'Qwen Plus' },
+          { modelId: 'openai/qwen-max', name: 'Qwen Max' },
+        ],
+      },
+      modes: {
+        currentModeId: 'default',
+        availableModes: [
+          { id: 'default', name: 'Default', description: 'Ask first' },
+          { id: 'yolo', name: 'YOLO', description: 'No prompts' },
+        ],
+      },
+    });
+
+    const modelChanged = modelReducer(loaded, {
+      type: 'model_changed',
+      modelId: 'openai/qwen-max',
+    });
+    const modeChanged = modelReducer(modelChanged, {
+      type: 'mode_changed',
+      mode: 'yolo',
+    });
+
+    expect(modeChanged.models?.currentModelId).toBe('openai/qwen-max');
+    expect(modeChanged.modes?.currentModeId).toBe('yolo');
+  });
+
+  it('promotes configured settings models into active session options', () => {
+    const withSettings = modelReducer(createInitialModelState(), {
+      type: 'settings_models_loaded',
+      settings: createSettings('qwen-e2e-cdp'),
+    });
+    const loaded = modelReducer(withSettings, {
+      type: 'session_runtime_loaded',
+      models: {
+        currentModelId: 'e2e/qwen-code',
+        availableModels: [{ modelId: 'e2e/qwen-code', name: 'Qwen Code E2E' }],
+      },
+    });
+
+    expect(loaded.models?.currentModelId).toBe('e2e/qwen-code');
+    expect(loaded.models?.availableModels).toEqual([
+      { modelId: 'e2e/qwen-code', name: 'Qwen Code E2E' },
+      {
+        modelId: 'qwen-e2e-cdp',
+        name: 'qwen-e2e-cdp',
+        description: 'Saved API key provider',
+        _meta: {
+          desktopProvider: 'api-key',
+          desktopProviderHasApiKey: true,
+        },
+      },
+    ]);
+  });
+
+  it('enriches compact runtime models with configured provider metadata', () => {
+    const withSettings = modelReducer(createInitialModelState(), {
+      type: 'settings_models_loaded',
+      settings: {
+        ...createSettings('qwen-e2e-cdp'),
+        openai: {
+          hasApiKey: false,
+          providers: [
+            {
+              id: 'qwen-e2e-cdp',
+              name: 'qwen-e2e-cdp',
+              baseUrl: 'https://example.invalid/v1',
+              envKey: 'OPENAI_API_KEY',
+            },
+          ],
+        },
+      },
+    });
+    const loaded = modelReducer(withSettings, {
+      type: 'session_runtime_loaded',
+      models: {
+        currentModelId: 'qwen-e2e-cdp',
+        availableModels: [
+          { modelId: 'e2e/qwen-code', name: 'Qwen Code E2E' },
+          { modelId: 'qwen-e2e-cdp', name: 'qwen-e2e-cdp' },
+        ],
+      },
+    });
+
+    expect(
+      loaded.models?.availableModels.find(
+        (model) => model.modelId === 'qwen-e2e-cdp',
+      ),
+    ).toEqual({
+      modelId: 'qwen-e2e-cdp',
+      name: 'qwen-e2e-cdp',
+      description: 'Saved API key provider',
+      _meta: {
+        desktopProvider: 'api-key',
+        desktopProviderHasApiKey: false,
+      },
+    });
+  });
+
+  it('refreshes stale provider key metadata from saved settings', () => {
+    const withSettings = modelReducer(createInitialModelState(), {
+      type: 'settings_models_loaded',
+      settings: createSettings('qwen-e2e-cdp'),
+    });
+    const loaded = modelReducer(withSettings, {
+      type: 'session_runtime_loaded',
+      models: {
+        currentModelId: 'qwen-e2e-cdp',
+        availableModels: [
+          {
+            modelId: 'qwen-e2e-cdp',
+            name: 'qwen-e2e-cdp',
+            _meta: {
+              desktopProvider: 'api-key',
+              desktopProviderHasApiKey: false,
+              runtimeField: 'kept',
+            },
+          },
+        ],
+      },
+    });
+
+    expect(loaded.models?.availableModels[0]?._meta).toEqual({
+      desktopProvider: 'api-key',
+      desktopProviderHasApiKey: true,
+      runtimeField: 'kept',
+    });
+  });
+
+  it('keeps configured settings models available across session resets', () => {
+    const withSettings = modelReducer(createInitialModelState(), {
+      type: 'settings_models_loaded',
+      settings: createSettings('qwen-e2e-cdp'),
+    });
+    const reset = modelReducer(withSettings, { type: 'reset' });
+    const loaded = modelReducer(reset, {
+      type: 'session_runtime_loaded',
+      models: {
+        currentModelId: 'e2e/qwen-code',
+        availableModels: [{ modelId: 'e2e/qwen-code', name: 'Qwen Code E2E' }],
+      },
+    });
+
+    expect(reset.models).toBeNull();
+    expect(
+      loaded.models?.availableModels.map((model) => model.modelId),
+    ).toEqual(['e2e/qwen-code', 'qwen-e2e-cdp']);
+  });
+
+  it('replaces stale configured options when settings change', () => {
+    const withOldSettings = modelReducer(createInitialModelState(), {
+      type: 'settings_models_loaded',
+      settings: createSettings('qwen-old'),
+    });
+    const loaded = modelReducer(withOldSettings, {
+      type: 'session_runtime_loaded',
+      models: {
+        currentModelId: 'e2e/qwen-code',
+        availableModels: [{ modelId: 'e2e/qwen-code', name: 'Qwen Code E2E' }],
+      },
+    });
+    const withNewSettings = modelReducer(loaded, {
+      type: 'settings_models_loaded',
+      settings: createSettings('qwen-new'),
+    });
+
+    expect(
+      withNewSettings.models?.availableModels.map((model) => model.modelId),
+    ).toEqual(['e2e/qwen-code', 'qwen-new']);
+  });
+
+  it('preserves richer model metadata after saving a compact runtime model', () => {
+    const loaded = modelReducer(createInitialModelState(), {
+      type: 'session_runtime_loaded',
+      models: {
+        currentModelId: 'e2e/qwen-code',
+        availableModels: [
+          { modelId: 'e2e/qwen-code', name: 'Qwen Code E2E' },
+          {
+            modelId: 'qwen3-coder-next',
+            name:
+              '[ModelStudio Coding Plan for Global/Intl] ' + 'qwen3-coder-next',
+            description: 'Coding Plan global model',
+          },
+        ],
+      },
+    });
+
+    const saved = modelReducer(loaded, {
+      type: 'model_saved',
+      models: {
+        currentModelId: 'qwen3-coder-next',
+        availableModels: [
+          { modelId: 'e2e/qwen-code', name: 'Qwen Code E2E' },
+          { modelId: 'qwen3-coder-next', name: 'qwen3-coder-next' },
+        ],
+      },
+    });
+
+    const codingPlanModel = saved.models?.availableModels.find(
+      (model) => model.modelId === 'qwen3-coder-next',
+    );
+    expect(saved.models?.currentModelId).toBe('qwen3-coder-next');
+    expect(codingPlanModel?.name).toBe(
+      '[ModelStudio Coding Plan for Global/Intl] qwen3-coder-next',
+    );
+    expect(codingPlanModel?.description).toBe('Coding Plan global model');
+  });
+
+  it('preserves provider metadata when API-key and Coding Plan models coexist', () => {
+    const state = modelReducer(createInitialModelState(), {
+      type: 'settings_models_loaded',
+      settings: createMixedProviderSettings(),
+    });
+
+    expect(state.configuredModels).toEqual([
+      {
+        modelId: 'qwen3.5-plus',
+        name: 'qwen3.5-plus',
+        description: 'Saved Coding Plan provider',
+        _meta: {
+          desktopProvider: 'coding-plan',
+          desktopProviderHasApiKey: true,
+        },
+      },
+      {
+        modelId: 'qwen-e2e-cdp',
+        name: 'qwen-e2e-cdp',
+        description: 'Saved API key provider',
+        _meta: {
+          desktopProvider: 'api-key',
+          desktopProviderHasApiKey: true,
+        },
+      },
+    ]);
+  });
+
+  it('tracks missing API key state on saved provider metadata', () => {
+    const state = modelReducer(createInitialModelState(), {
+      type: 'settings_models_loaded',
+      settings: {
+        ...createSettings('qwen-e2e-cdp'),
+        openai: {
+          hasApiKey: false,
+          providers: [
+            {
+              id: 'qwen-e2e-cdp',
+              name: 'qwen-e2e-cdp',
+              baseUrl: 'https://example.invalid/v1',
+              envKey: 'OPENAI_API_KEY',
+            },
+          ],
+        },
+      },
+    });
+
+    expect(state.configuredModels[0]?._meta).toEqual({
+      desktopProvider: 'api-key',
+      desktopProviderHasApiKey: false,
+    });
+  });
+});
+
+function createSettings(model: string): DesktopUserSettings {
+  return {
+    ok: true,
+    settingsPath: '/tmp/settings.json',
+    provider: 'api-key',
+    selectedAuthType: 'openai',
+    model: { name: model },
+    codingPlan: {
+      region: 'china',
+      hasApiKey: false,
+      version: null,
+    },
+    openai: {
+      hasApiKey: true,
+      providers: [
+        {
+          id: model,
+          name: model,
+          baseUrl: 'https://example.invalid/v1',
+          envKey: 'OPENAI_API_KEY',
+        },
+      ],
+    },
+  };
+}
+
+function createMixedProviderSettings(): DesktopUserSettings {
+  return {
+    ok: true,
+    settingsPath: '/tmp/settings.json',
+    provider: 'coding-plan',
+    selectedAuthType: 'openai',
+    model: { name: 'qwen3.5-plus' },
+    codingPlan: {
+      region: 'global',
+      hasApiKey: true,
+      version: 'v1',
+    },
+    openai: {
+      hasApiKey: true,
+      providers: [
+        {
+          id: 'qwen3.5-plus',
+          name: 'qwen3.5-plus',
+          baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+          envKey: 'QWEN_CODE_CODING_PLAN_API_KEY',
+        },
+        {
+          id: 'qwen-e2e-cdp',
+          name: 'qwen-e2e-cdp',
+          baseUrl: 'https://example.invalid/v1',
+          envKey: 'OPENAI_API_KEY',
+        },
+      ],
+    },
+  };
+}

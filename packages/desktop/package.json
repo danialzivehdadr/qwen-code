@@ -1,0 +1,47 @@
+{
+  "name": "@qwen-code/desktop",
+  "version": "0.15.2",
+  "description": "Electron desktop client for Qwen Code",
+  "private": true,
+  "type": "module",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "build": "npm run build:main && npm run build:preload && npm run build:renderer",
+    "build:main": "tsc --project tsconfig.main.json",
+    "build:preload": "esbuild src/preload/index.ts --bundle --platform=node --format=cjs --external:electron --outfile=dist/preload/index.cjs",
+    "build:renderer": "vite build",
+    "dev:renderer": "vite --host 127.0.0.1",
+    "e2e:cdp": "node scripts/e2e-cdp-smoke.mjs",
+    "lint": "eslint src --ext .ts,.tsx",
+    "package": "electron-builder --config electron-builder.yml",
+    "package:dir": "electron-builder --dir --config electron-builder.yml",
+    "smoke:package": "node scripts/smoke-packaged-app.mjs",
+    "start": "electron .",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit --project tsconfig.main.json && tsc --noEmit --project tsconfig.renderer.json"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.14.1",
+    "@qwen-code/qwen-code-core": "file:../core",
+    "@qwen-code/webui": "file:../webui",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@types/ws": "^8.5.10",
+    "@vitejs/plugin-react": "^4.2.0",
+    "electron": "41.3.0",
+    "electron-builder": "^26.8.1",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.0",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
