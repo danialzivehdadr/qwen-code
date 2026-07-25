@@ -1,0 +1,680 @@
+name: 'Release SDK'
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The version to release (e.g., v0.1.11). Required for manual patch releases.'
+        required: false
+        type: 'string'
+      ref:
+        description: 'The branch or ref (full git sha) to release SDK from.'
+        required: true
+        type: 'string'
+        default: 'main'
+      cli_source:
+        description: 'CLI source to bundle. "build_from_source" builds CLI from the current branch/ref (recommended when releasing CLI and SDK together). "npm_latest" uses the latest stable CLI from npm (recommended for standalone SDK releases).'
+        required: true
+        type: 'choice'
+        options:
+          - 'build_from_source'
+          - 'npm_latest'
+        default: 'npm_latest'
+      dry_run:
+        description: 'Run a dry-run of the release process; no branches, npm packages or GitHub releases will be created.'
+        required: true
+        type: 'boolean'
+        default: true
+      create_nightly_release:
+        description: 'Auto apply the nightly release tag, input version is ignored.'
+        required: false
+        type: 'boolean'
+        default: false
+      create_preview_release:
+        description: 'Auto apply the preview release tag, input version is ignored.'
+        required: false
+        type: 'boolean'
+        default: false
+      force_skip_tests:
+        description: 'Select to skip the "Run Tests" step in testing. Prod releases should run tests'
+        required: false
+        type: 'boolean'
+        default: false
+
+permissions:
+  contents: 'read'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.inputs.ref || github.sha }}-${{ github.event.inputs.create_nightly_release }}-${{ github.event.inputs.create_preview_release }}'
+  cancel-in-progress: "${{ github.event.inputs.create_nightly_release == 'true' || github.event.inputs.create_preview_release == 'true' }}"
+
+jobs:
+  # =============================================================================
+  # Phase 1: Prepare - Calculate versions, set flags, setup environment
+  # =============================================================================
+  prepare:
+    name: 'Prepare Release'
+    runs-on: 'ubuntu-latest'
+    if: "github.repository == 'QwenLM/qwen-code'"
+    outputs:
+      RELEASE_TAG: '${{ steps.version.outputs.RELEASE_TAG }}'
+      RELEASE_VERSION: '${{ steps.version.outputs.RELEASE_VERSION }}'
+      NPM_TAG: '${{ steps.version.outputs.NPM_TAG }}'
+      PREVIOUS_RELEASE_TAG: '${{ steps.version.outputs.PREVIOUS_RELEASE_TAG }}'
+      IS_NIGHTLY: '${{ steps.vars.outputs.is_nightly }}'
+      IS_PREVIEW: '${{ steps.vars.outputs.is_preview }}'
+      IS_DRY_RUN: '${{ steps.vars.outputs.is_dry_run }}'
+      CLI_SOURCE_MODE: '${{ steps.cli_source.outputs.mode }}'
+
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+          fetch-depth: 0
+
+      - name: 'Set booleans for simplified logic'
+        env:
+          CREATE_NIGHTLY_RELEASE: '${{ github.event.inputs.create_nightly_release }}'
+          CREATE_PREVIEW_RELEASE: '${{ github.event.inputs.create_preview_release }}'
+          DRY_RUN_INPUT: '${{ github.event.inputs.dry_run }}'
+        id: 'vars'
+        run: |-
+          is_nightly="false"
+          if [[ "${CREATE_NIGHTLY_RELEASE}" == "true" ]]; then
+            is_nightly="true"
+          fi
+          echo "is_nightly=${is_nightly}" >> "${GITHUB_OUTPUT}"
+
+          is_preview="false"
+          if [[ "${CREATE_PREVIEW_RELEASE}" == "true" ]]; then
+            is_preview="true"
+          fi
+          echo "is_preview=${is_preview}" >> "${GITHUB_OUTPUT}"
+
+          is_dry_run="false"
+          if [[ "${DRY_RUN_INPUT}" == "true" ]]; then
+            is_dry_run="true"
+          fi
+          echo "is_dry_run=${is_dry_run}" >> "${GITHUB_OUTPUT}"
+
+      - name: 'Validate force_skip_tests for stable releases'
+        env:
+          IS_NIGHTLY: '${{ steps.vars.outputs.is_nightly }}'
+          IS_PREVIEW: '${{ steps.vars.outputs.is_preview }}'
+          FORCE_SKIP_TESTS: '${{ github.event.inputs.force_skip_tests }}'
+        run: |
+          set -euo pipefail
+          if [[ "${IS_NIGHTLY}" == "false" && "${IS_PREVIEW}" == "false" && "${FORCE_SKIP_TESTS}" == "true" ]]; then
+            echo "::warning::force_skip_tests is enabled for a stable release. Tests SHOULD be run for production releases."
+          fi
+
+      - name: 'Setup SDK Environment'
+        uses: './.github/actions/setup-sdk-env'
+
+      - name: 'Get the version'
+        id: 'version'
+        run: |
+          set -euo pipefail
+          VERSION_ARGS=()
+          if [[ "${IS_NIGHTLY}" == "true" ]]; then
+            VERSION_ARGS+=(--type=nightly)
+          elif [[ "${IS_PREVIEW}" == "true" ]]; then
+            VERSION_ARGS+=(--type=preview)
+            if [[ -n "${MANUAL_VERSION}" ]]; then
+              VERSION_ARGS+=("--preview_version_override=${MANUAL_VERSION}")
+            fi
+          else
+            VERSION_ARGS+=(--type=stable)
+            if [[ -n "${MANUAL_VERSION}" ]]; then
+              VERSION_ARGS+=("--stable_version_override=${MANUAL_VERSION}")
+            fi
+          fi
+
+          VERSION_JSON=$(node packages/sdk-typescript/scripts/get-release-version.js "${VERSION_ARGS[@]}")
+          RELEASE_TAG=$(echo "$VERSION_JSON" | jq -r .releaseTag)
+          RELEASE_VERSION=$(echo "$VERSION_JSON" | jq -r .releaseVersion)
+          NPM_TAG=$(echo "$VERSION_JSON" | jq -r .npmTag)
+          PREVIOUS_RELEASE_TAG=$(echo "$VERSION_JSON" | jq -r .previousReleaseTag)
+
+          echo "RELEASE_TAG=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_VERSION=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "NPM_TAG=${NPM_TAG}" >> "$GITHUB_OUTPUT"
+          echo "PREVIOUS_RELEASE_TAG=${PREVIOUS_RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+          echo "========================================"
+          echo "SDK Release Version Info"
+          echo "========================================"
+          echo "Release Tag:        ${RELEASE_TAG}"
+          echo "Release Version:    ${RELEASE_VERSION}"
+          echo "NPM Tag:            ${NPM_TAG}"
+          echo "Previous Release:   ${PREVIOUS_RELEASE_TAG}"
+          echo "========================================"
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          IS_NIGHTLY: '${{ steps.vars.outputs.is_nightly }}'
+          IS_PREVIEW: '${{ steps.vars.outputs.is_preview }}'
+          MANUAL_VERSION: '${{ inputs.version }}'
+
+      - name: 'Determine CLI source mode'
+        id: 'cli_source'
+        env:
+          CLI_SOURCE_INPUT: '${{ github.event.inputs.cli_source }}'
+        run: |
+          set -euo pipefail
+          if [[ "${CLI_SOURCE_INPUT}" == "npm_latest" ]]; then
+            echo "mode=npm_latest" >> "$GITHUB_OUTPUT"
+            echo "CLI source: npm_latest"
+          else
+            echo "mode=build_from_source" >> "$GITHUB_OUTPUT"
+            echo "CLI source: build_from_source"
+          fi
+
+  # =============================================================================
+  # Phase 2a: Build CLI - Download from npm or build from source
+  # =============================================================================
+  build-cli:
+    name: 'Build CLI'
+    runs-on: 'ubuntu-latest'
+    needs: 'prepare'
+    if: "github.repository == 'QwenLM/qwen-code'"
+    outputs:
+      CLI_VERSION: '${{ steps.cli_version_npm.outputs.CLI_VERSION || steps.cli_build.outputs.CLI_VERSION }}'
+
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+          fetch-depth: 0
+
+      - name: 'Setup SDK Environment'
+        uses: './.github/actions/setup-sdk-env'
+
+      # ----- CLI from npm -----
+      - name: 'Get CLI version from npm'
+        id: 'cli_version_npm'
+        if: "needs.prepare.outputs.CLI_SOURCE_MODE == 'npm_latest'"
+        run: |
+          set -euo pipefail
+          CLI_VERSION=$(npm view @qwen-code/qwen-code version --tag=latest)
+          if [[ -z "${CLI_VERSION}" ]]; then
+            echo '::error::Could not get latest stable CLI version from npm'
+            exit 1
+          fi
+          echo "CLI_VERSION=${CLI_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Using CLI version from npm: ${CLI_VERSION}"
+
+      - name: 'Download CLI package from npm'
+        id: 'cli_download'
+        if: "needs.prepare.outputs.CLI_SOURCE_MODE == 'npm_latest'"
+        env:
+          CLI_VERSION: '${{ steps.cli_version_npm.outputs.CLI_VERSION }}'
+        run: |
+          set -euo pipefail
+          CLI_TMP_DIR=$(mktemp -d)
+          echo "CLI_TMP_DIR=${CLI_TMP_DIR}" >> "$GITHUB_OUTPUT"
+
+          echo "Downloading @qwen-code/qwen-code@${CLI_VERSION}..."
+          npm pack "@qwen-code/qwen-code@${CLI_VERSION}" --pack-destination "${CLI_TMP_DIR}"
+
+          cd "${CLI_TMP_DIR}"
+          tar -xzf qwen-code-qwen-code-*.tgz
+
+          echo "CLI package extracted to: ${CLI_TMP_DIR}/package"
+          ls -la "${CLI_TMP_DIR}/package/"
+
+      - name: 'Upload CLI package artifact'
+        if: "needs.prepare.outputs.CLI_SOURCE_MODE == 'npm_latest'"
+        uses: 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' # ratchet:actions/upload-artifact@v4
+        with:
+          name: 'cli-bundle'
+          path: '${{ steps.cli_download.outputs.CLI_TMP_DIR }}/package'
+          retention-days: 3
+
+      # ----- CLI from source -----
+      - name: 'Build CLI from source'
+        id: 'cli_build'
+        if: "needs.prepare.outputs.CLI_SOURCE_MODE == 'build_from_source'"
+        run: |
+          set -euo pipefail
+          echo "Building CLI from source..."
+          npm run bundle
+
+          CLI_VERSION=$(node -p "require('./packages/cli/package.json').version")
+          echo "CLI_VERSION=${CLI_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Built CLI version: ${CLI_VERSION}"
+
+          if [[ ! -f "./dist/cli.js" ]]; then
+            echo "::error::CLI bundle not found at ./dist/cli.js"
+            exit 1
+          fi
+
+          echo "CLI bundle built successfully at ./dist/"
+          ls -la ./dist/
+
+      - name: 'Upload CLI dist artifact'
+        if: "needs.prepare.outputs.CLI_SOURCE_MODE == 'build_from_source'"
+        uses: 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' # ratchet:actions/upload-artifact@v4
+        with:
+          name: 'cli-bundle'
+          path: |
+            dist/cli.js
+            dist/vendor/
+            dist/locales/
+          retention-days: 3
+
+  # =============================================================================
+  # Phase 2b: Build SDK - Compile TypeScript SDK
+  # =============================================================================
+  build-sdk:
+    name: 'Build SDK'
+    runs-on: 'ubuntu-latest'
+    needs: 'prepare'
+    if: "github.repository == 'QwenLM/qwen-code'"
+
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+          fetch-depth: 0
+
+      - name: 'Setup SDK Environment'
+        uses: './.github/actions/setup-sdk-env'
+
+      - name: 'Set SDK package version'
+        env:
+          RELEASE_VERSION: '${{ needs.prepare.outputs.RELEASE_VERSION }}'
+        run: |
+          set -euo pipefail
+          npm version -w @qwen-code/sdk "${RELEASE_VERSION}" --no-git-tag-version --allow-same-version
+
+      - name: 'Build SDK'
+        working-directory: 'packages/sdk-typescript'
+        run: 'npm run build'
+
+      - name: 'Upload SDK dist artifact'
+        uses: 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' # ratchet:actions/upload-artifact@v4
+        with:
+          name: 'sdk-dist'
+          path: 'packages/sdk-typescript/dist/'
+          retention-days: 3
+
+  # =============================================================================
+  # Phase 3: Bundle - Combine CLI into SDK
+  # =============================================================================
+  bundle-cli-into-sdk:
+    name: 'Bundle CLI into SDK'
+    runs-on: 'ubuntu-latest'
+    needs: ['prepare', 'build-cli', 'build-sdk']
+    if: "github.repository == 'QwenLM/qwen-code'"
+
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+          fetch-depth: 0
+
+      - name: 'Setup SDK Environment'
+        uses: './.github/actions/setup-sdk-env'
+
+      - name: 'Download CLI artifact'
+        uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' # ratchet:actions/download-artifact@v4
+        with:
+          name: 'cli-bundle'
+          path: 'cli-bundle/'
+
+      - name: 'Download SDK artifact'
+        uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' # ratchet:actions/download-artifact@v4
+        with:
+          name: 'sdk-dist'
+          path: 'packages/sdk-typescript/dist/'
+
+      - name: 'Bundle CLI into SDK'
+        working-directory: 'packages/sdk-typescript'
+        env:
+          CLI_SOURCE_MODE: '${{ needs.prepare.outputs.CLI_SOURCE_MODE }}'
+        run: |
+          set -euo pipefail
+          if [[ "${CLI_SOURCE_MODE}" == "npm_latest" ]]; then
+            CLI_PACKAGE_PATH="${GITHUB_WORKSPACE}/cli-bundle" \
+              node scripts/bundle-cli-from-npm.js
+          else
+            # Copy CLI dist to expected location for bundle-cli.js
+            mkdir -p "${GITHUB_WORKSPACE}/dist"
+            cp -r "${GITHUB_WORKSPACE}/cli-bundle/"* "${GITHUB_WORKSPACE}/dist/"
+            node scripts/bundle-cli.js
+          fi
+
+      - name: 'Upload bundled SDK artifact'
+        uses: 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' # ratchet:actions/upload-artifact@v4
+        with:
+          name: 'sdk-with-cli'
+          path: 'packages/sdk-typescript/dist/'
+          retention-days: 3
+
+  # =============================================================================
+  # Phase 4a: Unit Tests
+  # =============================================================================
+  test-unit:
+    name: 'Unit Tests'
+    runs-on: 'ubuntu-latest'
+    needs: 'prepare'
+    if: |
+      github.repository == 'QwenLM/qwen-code' &&
+      github.event.inputs.force_skip_tests != 'true'
+
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+
+      - name: 'Setup SDK Environment'
+        uses: './.github/actions/setup-sdk-env'
+
+      - name: 'Run Unit Tests'
+        working-directory: 'packages/sdk-typescript'
+        run: 'npm run test:ci'
+        env:
+          OPENAI_API_KEY: '${{ secrets.OPENAI_API_KEY }}'
+          OPENAI_BASE_URL: '${{ secrets.OPENAI_BASE_URL }}'
+          OPENAI_MODEL: '${{ secrets.OPENAI_MODEL }}'
+
+  # =============================================================================
+  # Phase 4b: Integration Tests (Matrix)
+  # =============================================================================
+  test-integration:
+    name: 'Integration Tests'
+    runs-on: '${{ matrix.os }}'
+    needs: ['prepare', 'bundle-cli-into-sdk', 'test-unit']
+    if: |
+      github.repository == 'QwenLM/qwen-code' &&
+      github.event.inputs.force_skip_tests != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu + Node 20.x + sandbox:none
+          - os: 'ubuntu-latest'
+            node-version: '20.x'
+            sandbox: 'none'
+            test-command: 'test:integration:sdk:sandbox:none'
+          # Ubuntu + Node 20.x + sandbox:docker
+          - os: 'ubuntu-latest'
+            node-version: '20.x'
+            sandbox: 'docker'
+            test-command: 'test:integration:sdk:sandbox:docker'
+          # Ubuntu + Node 22.x + sandbox:none
+          - os: 'ubuntu-latest'
+            node-version: '22.x'
+            sandbox: 'none'
+            test-command: 'test:integration:sdk:sandbox:none'
+          # Ubuntu + Node 22.x + sandbox:docker
+          - os: 'ubuntu-latest'
+            node-version: '22.x'
+            sandbox: 'docker'
+            test-command: 'test:integration:sdk:sandbox:docker'
+          # macOS + Node 20.x + sandbox:none (no docker on macOS)
+          - os: 'macos-latest'
+            node-version: '20.x'
+            sandbox: 'none'
+            test-command: 'test:integration:sdk:sandbox:none'
+          # macOS + Node 22.x + sandbox:none
+          - os: 'macos-latest'
+            node-version: '22.x'
+            sandbox: 'none'
+            test-command: 'test:integration:sdk:sandbox:none'
+
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+
+      - name: 'Setup SDK Environment'
+        uses: './.github/actions/setup-sdk-env'
+        with:
+          node-version: '${{ matrix.node-version }}'
+
+      - name: 'Set up Docker'
+        if: "matrix.sandbox == 'docker'"
+        uses: 'docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435' # ratchet:docker/setup-buildx-action@v3
+
+      - name: 'Download bundled SDK artifact'
+        uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' # ratchet:actions/download-artifact@v4
+        with:
+          name: 'sdk-with-cli'
+          path: 'packages/sdk-typescript/dist/'
+
+      - name: 'Run Integration Tests'
+        run: 'npm run ${{ matrix.test-command }}'
+        env:
+          OPENAI_API_KEY: '${{ secrets.OPENAI_API_KEY }}'
+          OPENAI_BASE_URL: '${{ secrets.OPENAI_BASE_URL }}'
+          OPENAI_MODEL: '${{ secrets.OPENAI_MODEL }}'
+
+  # =============================================================================
+  # Phase 5: Publish to NPM
+  # =============================================================================
+  publish-npm:
+    name: 'Publish to NPM'
+    runs-on: 'ubuntu-latest'
+    needs:
+      [
+        'prepare',
+        'build-cli',
+        'bundle-cli-into-sdk',
+        'test-unit',
+        'test-integration',
+      ]
+    if: |
+      github.repository == 'QwenLM/qwen-code' &&
+      (needs.test-unit.result == 'success' || needs.test-unit.result == 'skipped') &&
+      (needs.test-integration.result == 'success' || needs.test-integration.result == 'skipped')
+    environment:
+      name: 'production-release'
+      url: '${{ github.server_url }}/${{ github.repository }}/releases/tag/sdk-typescript-${{ needs.prepare.outputs.RELEASE_TAG }}'
+
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+
+      - name: 'Setup SDK Environment'
+        uses: './.github/actions/setup-sdk-env'
+
+      - name: 'Set SDK package version'
+        env:
+          RELEASE_VERSION: '${{ needs.prepare.outputs.RELEASE_VERSION }}'
+        run: |
+          set -euo pipefail
+          npm version -w @qwen-code/sdk "${RELEASE_VERSION}" --no-git-tag-version --allow-same-version
+
+      - name: 'Download bundled SDK artifact'
+        uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' # ratchet:actions/download-artifact@v4
+        with:
+          name: 'sdk-with-cli'
+          path: 'packages/sdk-typescript/dist/'
+
+      - name: 'Record bundled CLI version'
+        env:
+          CLI_VERSION: '${{ needs.build-cli.outputs.CLI_VERSION }}'
+        run: |
+          set -euo pipefail
+          echo "${CLI_VERSION}" > packages/sdk-typescript/dist/BUNDLED_CLI_VERSION
+          echo "Bundled CLI version: ${CLI_VERSION}"
+
+      - name: 'Publish @qwen-code/sdk'
+        working-directory: 'packages/sdk-typescript'
+        run: |
+          set -euo pipefail
+          DRY_RUN_FLAG=""
+          if [[ "${IS_DRY_RUN}" == "true" ]]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+          npm publish --access public --tag="${NPM_TAG}" ${DRY_RUN_FLAG}
+        env:
+          NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}'
+          IS_DRY_RUN: '${{ needs.prepare.outputs.IS_DRY_RUN }}'
+          NPM_TAG: '${{ needs.prepare.outputs.NPM_TAG }}'
+
+  # =============================================================================
+  # Phase 6a: Create GitHub Release
+  # =============================================================================
+  create-release:
+    name: 'Create GitHub Release'
+    runs-on: 'ubuntu-latest'
+    needs: ['prepare', 'publish-npm', 'build-cli']
+    if: |
+      github.repository == 'QwenLM/qwen-code' &&
+      needs.prepare.outputs.IS_DRY_RUN == 'false'
+    permissions:
+      contents: 'write'
+
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+          fetch-depth: 0
+
+      - name: 'Generate SDK release notes'
+        id: 'release_notes'
+        uses: './.github/actions/generate-release-notes'
+        with:
+          release-tag: '${{ needs.prepare.outputs.RELEASE_TAG }}'
+          previous-release-tag: '${{ needs.prepare.outputs.PREVIOUS_RELEASE_TAG }}'
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+          cli-version: '${{ needs.build-cli.outputs.CLI_VERSION }}'
+          cli-source-mode: '${{ needs.prepare.outputs.CLI_SOURCE_MODE }}'
+
+      - name: 'Create GitHub Release and Tag'
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          RELEASE_TAG: '${{ needs.prepare.outputs.RELEASE_TAG }}'
+          IS_NIGHTLY: '${{ needs.prepare.outputs.IS_NIGHTLY }}'
+          IS_PREVIEW: '${{ needs.prepare.outputs.IS_PREVIEW }}'
+          REF: '${{ github.event.inputs.ref || github.sha }}'
+          NOTES_FILE: '${{ steps.release_notes.outputs.notes-file }}'
+        run: |
+          set -euo pipefail
+          if [[ "${IS_NIGHTLY}" == "true" || "${IS_PREVIEW}" == "true" ]]; then
+            TARGET="${REF}"
+            PRERELEASE_FLAG="--prerelease"
+          else
+            TARGET="${REF}"
+            PRERELEASE_FLAG=""
+          fi
+
+          # Determine CLI source description
+          if [[ "${CLI_SOURCE_MODE}" == "npm_latest" ]]; then
+            CLI_SOURCE_DESC="latest stable CLI from npm"
+          else
+            CLI_SOURCE_DESC="CLI built from source (same branch/ref as SDK)"
+          fi
+
+          # Create release notes file
+          NOTES_FILE=$(mktemp)
+          {
+            echo "## Bundled CLI Version"
+            echo ""
+            echo "This SDK release bundles CLI version: ${CLI_VERSION}"
+            echo ""
+            echo "Source: ${CLI_SOURCE_DESC}"
+            echo ""
+            echo "---"
+            echo ""
+          } > "${NOTES_FILE}"
+
+          # Get previous release notes if available
+          PREVIOUS_NOTES=$(gh release view "sdk-typescript-${PREVIOUS_RELEASE_TAG}" --json body -q '.body' 2>/dev/null || echo 'See commit history for changes.')
+          printf '%s\n' "${PREVIOUS_NOTES}" >> "${NOTES_FILE}"
+
+          # Create GitHub release
+          gh release create "sdk-typescript-${RELEASE_TAG}" \
+            --target "${TARGET}" \
+            --title "SDK TypeScript Release ${RELEASE_TAG}" \
+            --notes-file "${NOTES_FILE}" \
+            ${PRERELEASE_FLAG}
+
+          # Cleanup
+          rm -f "${NOTES_FILE}"
+
+  # =============================================================================
+  # Phase 6b: Post-Release (Stable Only)
+  # =============================================================================
+  post-release:
+    name: 'Post-Release Tasks'
+    runs-on: 'ubuntu-latest'
+    needs: ['prepare', 'create-release']
+    if: |
+      github.repository == 'QwenLM/qwen-code' &&
+      needs.prepare.outputs.IS_DRY_RUN == 'false' &&
+      needs.prepare.outputs.IS_NIGHTLY == 'false' &&
+      needs.prepare.outputs.IS_PREVIEW == 'false'
+    environment:
+      name: 'production-release'
+    permissions:
+      contents: 'write'
+      pull-requests: 'write'
+
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: '${{ github.event.inputs.ref || github.sha }}'
+          fetch-depth: 0
+
+      - name: 'Setup SDK Environment'
+        uses: './.github/actions/setup-sdk-env'
+        with:
+          install-deps: 'false'
+
+      - name: 'Create release branch and PR'
+        uses: './.github/actions/post-release-pr'
+        with:
+          release-version: '${{ needs.prepare.outputs.RELEASE_VERSION }}'
+          release-tag: '${{ needs.prepare.outputs.RELEASE_TAG }}'
+          workspace-package: '@qwen-code/sdk'
+          github-token: '${{ secrets.CI_BOT_PAT }}'
+
+  # =============================================================================
+  # Phase 7: Failure Notification
+  # =============================================================================
+  failure-notification:
+    name: 'Failure Notification'
+    runs-on: 'ubuntu-latest'
+    needs:
+      [
+        'prepare',
+        'build-cli',
+        'build-sdk',
+        'bundle-cli-into-sdk',
+        'test-unit',
+        'test-integration',
+        'publish-npm',
+        'create-release',
+        'post-release',
+      ]
+    if: |
+      failure() &&
+      github.repository == 'QwenLM/qwen-code' &&
+      github.event.inputs.dry_run != 'true'
+    permissions:
+      issues: 'write'
+
+    steps:
+      - name: 'Create Issue on Failure'
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          RELEASE_TAG: "${{ needs.prepare.outputs.RELEASE_TAG || 'N/A' }}"
+          DETAILS_URL: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+        run: |
+          set -euo pipefail
+          gh issue create \
+            --title "SDK Release Failed for ${RELEASE_TAG} on $(date +'%Y-%m-%d')" \
+            --body "The SDK release workflow failed. See the full run for details: ${DETAILS_URL}"
