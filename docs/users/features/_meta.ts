@@ -1,0 +1,20 @@
+export default {
+  commands: 'Commands',
+  'followup-suggestions': 'Followup Suggestions',
+  'sub-agents': 'SubAgents',
+  arena: 'Agent Arena',
+  skills: 'Skills',
+  headless: 'Headless Mode',
+  checkpointing: {
+    display: 'hidden',
+  },
+  'approval-mode': 'Approval Mode',
+  mcp: 'MCP',
+  lsp: 'LSP (Language Server Protocol)',
+  'token-caching': 'Token Caching',
+  sandbox: 'Sandboxing',
+  language: 'i18n',
+  channels: 'Channels',
+  hooks: 'Hooks',
+  'scheduled-tasks': 'Scheduled Tasks',
+};
