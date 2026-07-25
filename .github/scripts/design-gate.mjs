@@ -1,0 +1,98 @@
+#!/usr/bin/env node
+
+import {
+  parseArgs,
+  readJson,
+  requireArg,
+  run,
+  writeJson,
+  writeText,
+} from './lib/cli.mjs';
+import { loadAnchors } from './lib/anchors.mjs';
+import {
+  buildDesignGateLlmPrompt,
+  evaluateDesignGate,
+  formatProcessComment,
+  formatPromptAppend,
+} from './lib/design-gate-core.mjs';
+import { runQwenJson } from './lib/llm.mjs';
+
+async function maybeRunLlm({ pr, shape, history, anchors }) {
+  if (process.env.QWEN_DESIGN_GATE_LLM !== 'true') {
+    return { findings: [] };
+  }
+
+  try {
+    const result = await runQwenJson({
+      prompt: buildDesignGateLlmPrompt({ pr, shape, history, anchors }),
+    });
+    return result.json && Array.isArray(result.json.findings)
+      ? result.json
+      : { findings: [] };
+  } catch (error) {
+    return {
+      findings: [
+        {
+          gate: 'product_direction',
+          severity: 'advisory',
+          message: `Design Gate LLM check skipped: ${error.message}`,
+          citations: [],
+        },
+      ],
+    };
+  }
+}
+
+async function main() {
+  const args = parseArgs();
+  const repo = requireArg(args, 'repo');
+  const prNumber = requireArg(args, 'pr');
+  console.log('Design Gate: reading PR shape');
+  const shape = await readJson(requireArg(args, 'shape'));
+  console.log('Design Gate: reading history scan');
+  const history = await readJson(requireArg(args, 'history'), { findings: [] });
+  const out = requireArg(args, 'out');
+
+  console.log('Design Gate: resolving PR metadata');
+  const pr =
+    (await readJson(args['pr-json'], undefined)) ??
+    JSON.parse(
+      await run('gh', [
+        'pr',
+        'view',
+        prNumber,
+        '--repo',
+        repo,
+        '--json',
+        'title,body,url,baseRefName,headRefName',
+      ]),
+    );
+
+  console.log('Design Gate: loading anchors');
+  const anchors = await loadAnchors({
+    rootDir: args.root ?? process.cwd(),
+    changedFiles: shape.changed_files,
+  });
+  console.log(
+    `Design Gate: running LLM check (enabled=${process.env.QWEN_DESIGN_GATE_LLM === 'true'})`,
+  );
+  const llm = await maybeRunLlm({ pr, shape, history, anchors });
+  console.log('Design Gate: evaluating findings');
+  const result = evaluateDesignGate({ pr, shape, history, anchors, llm });
+
+  await writeJson(out, result);
+  if (args['process-comment-out']) {
+    await writeText(args['process-comment-out'], formatProcessComment(result));
+  }
+  if (args['prompt-append-out']) {
+    await writeText(args['prompt-append-out'], formatPromptAppend(result));
+  }
+
+  console.log(`Design Gate status: ${result.status}`);
+  console.log(result.summary);
+}
+
+main().catch((error) => {
+  console.error(error.stack ?? error.message);
+  process.exit(1);
+});

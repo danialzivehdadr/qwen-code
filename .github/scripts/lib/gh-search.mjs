@@ -1,0 +1,243 @@
+import { run } from './cli.mjs';
+import {
+  buildHistoryQueries,
+  classifyHistoryResults,
+} from './history-core.mjs';
+import { extractKeywords } from './pr-shape-core.mjs';
+
+async function ghJson(args) {
+  const stdout = await run('gh', args);
+  return JSON.parse(stdout || '[]');
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripRepoQualifier(query, repo) {
+  if (!repo) {
+    return query;
+  }
+  return query
+    .replace(new RegExp(`\\s+repo:${escapeRegExp(repo)}(?=\\s|$)`, 'g'), '')
+    .trim();
+}
+
+async function searchIssues({ query, repo, state = 'closed', limit = 20 }) {
+  return ghJson([
+    'search',
+    'issues',
+    stripRepoQualifier(query, repo),
+    '--repo',
+    repo,
+    '--state',
+    state,
+    '--limit',
+    String(limit),
+    '--json',
+    'number,title,url,state,closedAt,labels',
+  ]);
+}
+
+export function buildSearchPrsArgs({
+  query,
+  repo,
+  state,
+  merged = false,
+  limit = 20,
+}) {
+  const args = [
+    'search',
+    'prs',
+    stripRepoQualifier(query, repo),
+    '--repo',
+    repo,
+  ];
+
+  if (merged) {
+    args.push('--merged');
+  } else if (state) {
+    args.push('--state', state);
+  }
+
+  args.push(
+    '--limit',
+    String(limit),
+    '--json',
+    'number,title,url,state,closedAt,labels',
+  );
+
+  return args;
+}
+
+async function searchPrs({ query, repo, state, merged = false, limit = 20 }) {
+  return ghJson(buildSearchPrsArgs({ query, repo, state, merged, limit }));
+}
+
+function uniquePulls(pulls = []) {
+  const seen = new Set();
+  const unique = [];
+  for (const pull of pulls) {
+    if (seen.has(pull.number)) {
+      continue;
+    }
+    seen.add(pull.number);
+    unique.push(pull);
+  }
+  return unique;
+}
+
+async function issueComments({ repo, number }) {
+  try {
+    return ghJson([
+      'api',
+      `repos/${repo}/issues/${number}/comments`,
+      '--paginate',
+      '--jq',
+      '[.[] | {body: .body, url: .html_url, createdAt: .created_at}]',
+    ]);
+  } catch {
+    return [];
+  }
+}
+
+async function withIssueComments({ repo, pulls, limit }) {
+  return Promise.all(
+    pulls.slice(0, limit).map(async (pull) => ({
+      ...pull,
+      comments: await issueComments({ repo, number: pull.number }),
+    })),
+  );
+}
+
+export async function scanHistory({ repo, pr, shape, limit = 20 }) {
+  const keywords = extractKeywords({
+    title: pr.title,
+    body: pr.body,
+    files: shape.changed_files,
+  });
+  const queries = buildHistoryQueries({ keywords, repo });
+  const byDesignBlockingQueries = queries.byDesignBlockingCandidates ?? [
+    queries.byDesign,
+  ];
+  const byDesignAdvisoryQueries = queries.byDesignAdvisoryCandidates ?? [];
+
+  // Track failures so a fully-degraded scan (e.g. GitHub secondary rate
+  // limit fires on every search endpoint at once) cannot masquerade as
+  // a clean "no prior direction signal" history.
+  const searchErrors = [];
+  const guard = (label, promise) =>
+    promise.catch((error) => {
+      searchErrors.push(`${label}: ${error.message}`);
+      return [];
+    });
+  const guardAll = (label, promises) =>
+    Promise.all(promises.map((p, i) => guard(`${label}[${i}]`, p)));
+
+  const [
+    closedIssues,
+    mergedPrs,
+    byDesignClosedPrsByQuery,
+    directionCandidatePrsByQuery,
+    badSignals,
+  ] = await Promise.all([
+    guard(
+      'closedIssues',
+      searchIssues({ query: queries.closedIssues, repo, limit }),
+    ),
+    guard(
+      'mergedPrs',
+      searchPrs({ query: queries.mergedPrs, repo, merged: true, limit }),
+    ),
+    guardAll(
+      'byDesignBlocking',
+      byDesignBlockingQueries.map((query) =>
+        searchPrs({ query, repo, state: 'closed', limit }),
+      ),
+    ),
+    guardAll(
+      'byDesignAdvisory',
+      byDesignAdvisoryQueries.map((query) =>
+        searchPrs({ query, repo, state: 'closed', limit }),
+      ),
+    ),
+    guard(
+      'regression',
+      searchPrs({
+        query: queries.regression,
+        repo,
+        merged: true,
+        limit: Math.min(limit, 10),
+      }),
+    ),
+  ]);
+
+  // Five categories fire (issues, merged, blocking, advisory,
+  // regression). If every one came back empty AND at least one errored,
+  // the scan is degraded rather than genuinely clean.
+  const everyResultEmpty =
+    closedIssues.length === 0 &&
+    mergedPrs.length === 0 &&
+    byDesignClosedPrsByQuery.every((r) => r.length === 0) &&
+    directionCandidatePrsByQuery.every((r) => r.length === 0) &&
+    badSignals.length === 0;
+  const degraded = everyResultEmpty && searchErrors.length > 0;
+
+  const byDesignClosedPrs = uniquePulls(byDesignClosedPrsByQuery.flat());
+  const directionCandidatePrs = uniquePulls(
+    directionCandidatePrsByQuery.flat(),
+  ).filter(
+    (pull) =>
+      !byDesignClosedPrs.some(
+        (blockingPull) => blockingPull.number === pull.number,
+      ),
+  );
+  const byDesignWithComments = await withIssueComments({
+    repo,
+    pulls: byDesignClosedPrs,
+    limit: 10,
+  });
+  const directionCandidatesWithComments = await withIssueComments({
+    repo,
+    pulls: directionCandidatePrs,
+    limit: 10,
+  });
+
+  const classified = classifyHistoryResults({
+    prBody: pr.body,
+    closedIssues,
+    mergedPrs,
+    byDesignClosedPrs: byDesignWithComments,
+    directionCandidatePrs: directionCandidatesWithComments,
+    badSignals,
+  });
+
+  if (degraded) {
+    classified.findings.unshift({
+      kind: 'history_scan_degraded',
+      severity: 'advisory',
+      message:
+        'History scan returned no results and at least one GitHub search failed (likely rate limiting). Prior closed-unmerged direction decisions could not be verified for this run.',
+      citations: [],
+      source: { errors: searchErrors.slice(0, 5) },
+    });
+  }
+
+  return {
+    keywords,
+    queries,
+    degraded,
+    searchErrors,
+    ...classified,
+    raw: {
+      closedIssues,
+      mergedPrs,
+      byDesignClosedPrs: uniquePulls([
+        ...byDesignWithComments,
+        ...directionCandidatesWithComments,
+      ]),
+      directionCandidatePrs: directionCandidatesWithComments,
+      badSignals,
+    },
+  };
+}
