@@ -1,0 +1,781 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import { render } from 'ink-testing-library';
+import { describe, it, expect, vi } from 'vitest';
+import { Text } from 'ink';
+import type React from 'react';
+import { ToolGroupMessage } from './ToolGroupMessage.js';
+import type { IndividualToolCallDisplay } from '../../types.js';
+import { ToolCallStatus } from '../../types.js';
+import type {
+  AgentResultDisplay,
+  Config,
+  ToolCallConfirmationDetails,
+} from '@qwen-code/qwen-code-core';
+import { TOOL_STATUS } from '../../constants.js';
+import { ConfigContext } from '../../contexts/ConfigContext.js';
+
+// Mock child components to isolate ToolGroupMessage behavior
+vi.mock('./ToolMessage.js', () => ({
+  ToolMessage: function MockToolMessage({
+    callId,
+    name,
+    description,
+    status,
+    emphasis,
+    resultDisplay,
+    isFocused,
+  }: {
+    callId: string;
+    name: string;
+    description: string;
+    status: ToolCallStatus;
+    emphasis: string;
+    resultDisplay?: unknown;
+    isFocused?: boolean;
+  }) {
+    // Use the same constants as the real component
+    const statusSymbolMap: Record<ToolCallStatus, string> = {
+      [ToolCallStatus.Success]: TOOL_STATUS.SUCCESS,
+      [ToolCallStatus.Pending]: TOOL_STATUS.PENDING,
+      [ToolCallStatus.Executing]: TOOL_STATUS.EXECUTING,
+      [ToolCallStatus.Confirming]: TOOL_STATUS.CONFIRMING,
+      [ToolCallStatus.Canceled]: TOOL_STATUS.CANCELED,
+      [ToolCallStatus.Error]: TOOL_STATUS.ERROR,
+    };
+    const statusSymbol = statusSymbolMap[status] || '?';
+    if (
+      resultDisplay &&
+      typeof resultDisplay === 'object' &&
+      (resultDisplay as { type?: string }).type === 'task_execution'
+    ) {
+      return (
+        <Text>
+          MockSubagent[{callId}]: focused={String(isFocused)}
+        </Text>
+      );
+    }
+
+    return (
+      <Text>
+        MockTool[{callId}]: {statusSymbol} {name} - {description} ({emphasis})
+      </Text>
+    );
+  },
+}));
+
+vi.mock('./ToolConfirmationMessage.js', () => ({
+  ToolConfirmationMessage: function MockToolConfirmationMessage({
+    confirmationDetails,
+  }: {
+    confirmationDetails: ToolCallConfirmationDetails;
+  }) {
+    const displayText =
+      confirmationDetails?.type === 'info'
+        ? (confirmationDetails as { prompt: string }).prompt
+        : confirmationDetails?.title || 'confirm';
+    return <Text>MockConfirmation: {displayText}</Text>;
+  },
+}));
+
+vi.mock('../subagents/index.js', () => ({
+  AgentTree: function MockAgentTree({
+    agents,
+  }: {
+    agents: Array<{
+      callId: string;
+      data: { subagentName?: string };
+      isFocused?: boolean;
+    }>;
+  }) {
+    return (
+      <Text>
+        MockAgentTree[
+        {agents
+          .map(
+            (a) =>
+              `${a.callId}:${a.data.subagentName ?? '?'}:focused=${String(
+                Boolean(a.isFocused),
+              )}`,
+          )
+          .join('|')}
+        ]
+      </Text>
+    );
+  },
+}));
+
+describe('<ToolGroupMessage />', () => {
+  const mockConfig: Config = {} as Config;
+
+  const createToolCall = (
+    overrides: Partial<IndividualToolCallDisplay> = {},
+  ): IndividualToolCallDisplay => ({
+    callId: 'tool-123',
+    name: 'test-tool',
+    description: 'A tool for testing',
+    resultDisplay: 'Test result',
+    status: ToolCallStatus.Success,
+    confirmationDetails: undefined,
+    renderOutputAsMarkdown: false,
+    ...overrides,
+  });
+
+  const baseProps = {
+    groupId: 1,
+    contentWidth: 80,
+    isFocused: true,
+  };
+
+  // Helper to wrap component with required providers
+  const renderWithProviders = (component: React.ReactElement) =>
+    render(
+      <ConfigContext.Provider value={mockConfig}>
+        {component}
+      </ConfigContext.Provider>,
+    );
+
+  describe('Golden Snapshots', () => {
+    it('renders single successful tool call', () => {
+      const toolCalls = [createToolCall()];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={toolCalls} />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('renders multiple tool calls with different statuses', () => {
+      const toolCalls = [
+        createToolCall({
+          callId: 'tool-1',
+          name: 'successful-tool',
+          description: 'This tool succeeded',
+          status: ToolCallStatus.Success,
+        }),
+        createToolCall({
+          callId: 'tool-2',
+          name: 'pending-tool',
+          description: 'This tool is pending',
+          status: ToolCallStatus.Pending,
+        }),
+        createToolCall({
+          callId: 'tool-3',
+          name: 'error-tool',
+          description: 'This tool failed',
+          status: ToolCallStatus.Error,
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={toolCalls} />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('renders tool call awaiting confirmation', () => {
+      const toolCalls = [
+        createToolCall({
+          callId: 'tool-confirm',
+          name: 'confirmation-tool',
+          description: 'This tool needs confirmation',
+          status: ToolCallStatus.Confirming,
+          confirmationDetails: {
+            type: 'info',
+            title: 'Confirm Tool Execution',
+            prompt: 'Are you sure you want to proceed?',
+            onConfirm: vi.fn(),
+          },
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={toolCalls} />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('renders shell command with yellow border', () => {
+      const toolCalls = [
+        createToolCall({
+          callId: 'shell-1',
+          name: 'run_shell_command',
+          description: 'Execute shell command',
+          status: ToolCallStatus.Success,
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={toolCalls} />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('renders mixed tool calls including shell command', () => {
+      const toolCalls = [
+        createToolCall({
+          callId: 'tool-1',
+          name: 'read_file',
+          description: 'Read a file',
+          status: ToolCallStatus.Success,
+        }),
+        createToolCall({
+          callId: 'tool-2',
+          name: 'run_shell_command',
+          description: 'Run command',
+          status: ToolCallStatus.Executing,
+        }),
+        createToolCall({
+          callId: 'tool-3',
+          name: 'write_file',
+          description: 'Write to file',
+          status: ToolCallStatus.Pending,
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={toolCalls} />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('renders with limited terminal height', () => {
+      const toolCalls = [
+        createToolCall({
+          callId: 'tool-1',
+          name: 'tool-with-result',
+          description: 'Tool with output',
+          resultDisplay:
+            'This is a long result that might need height constraints',
+        }),
+        createToolCall({
+          callId: 'tool-2',
+          name: 'another-tool',
+          description: 'Another tool',
+          resultDisplay: 'More output here',
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          toolCalls={toolCalls}
+          availableTerminalHeight={10}
+        />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('renders when not focused', () => {
+      const toolCalls = [createToolCall()];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          toolCalls={toolCalls}
+          isFocused={false}
+        />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('renders with narrow terminal width', () => {
+      const toolCalls = [
+        createToolCall({
+          name: 'very-long-tool-name-that-might-wrap',
+          description:
+            'This is a very long description that might cause wrapping issues',
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          toolCalls={toolCalls}
+          contentWidth={40}
+        />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('renders empty tool calls array', () => {
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={[]} />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+  });
+
+  describe('SubAgent focus', () => {
+    // Helper to build a running SubAgent result display
+    const createRunningSubagentDisplay = (
+      name: string,
+    ): AgentResultDisplay => ({
+      type: 'task_execution',
+      subagentName: name,
+      taskDescription: `${name} task`,
+      taskPrompt: `Run ${name}`,
+      status: 'running',
+      toolCalls: [
+        {
+          callId: `${name}-read-1`,
+          name: 'read_file',
+          status: 'success',
+          description: 'Read file',
+        },
+      ],
+    });
+
+    // Helper to build a completed SubAgent result display
+    const createCompletedSubagentDisplay = (
+      name: string,
+    ): AgentResultDisplay => ({
+      type: 'task_execution',
+      subagentName: name,
+      taskDescription: `${name} task`,
+      taskPrompt: `Run ${name}`,
+      status: 'completed',
+      toolCalls: [
+        {
+          callId: `${name}-read-1`,
+          name: 'read_file',
+          status: 'success',
+          description: 'Read file',
+        },
+      ],
+    });
+
+    it('keeps a normal running subagent focused so Ctrl+E can expand it', () => {
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          toolCalls={[
+            createToolCall({
+              callId: 'agent-1',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('reviewer'),
+            }),
+          ]}
+        />,
+      );
+
+      expect(lastFrame()).toContain('MockSubagent[agent-1]: focused=true');
+    });
+
+    it('does not focus a running subagent when the parent group is not focused', () => {
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          isFocused={false}
+          toolCalls={[
+            createToolCall({
+              callId: 'agent-1',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('reviewer'),
+            }),
+          ]}
+        />,
+      );
+
+      expect(lastFrame()).toContain('MockSubagent[agent-1]: focused=false');
+    });
+
+    it('gives focus to only the first running subagent when multiple are running', () => {
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          toolCalls={[
+            createToolCall({
+              callId: 'agent-1',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('first'),
+            }),
+            createToolCall({
+              callId: 'agent-2',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('second'),
+            }),
+          ]}
+        />,
+      );
+
+      expect(lastFrame()).toContain('MockSubagent[agent-1]: focused=true');
+      expect(lastFrame()).toContain('MockSubagent[agent-2]: focused=false');
+    });
+
+    it('pending confirmation wins over running fallback', () => {
+      const pendingDisplay: AgentResultDisplay = {
+        ...createRunningSubagentDisplay('pending-agent'),
+        pendingConfirmation: {
+          type: 'info',
+          title: 'Approve?',
+          prompt: 'Allow this action?',
+          onConfirm: vi.fn(),
+        },
+      };
+
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          toolCalls={[
+            createToolCall({
+              callId: 'agent-running',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('runner'),
+            }),
+            createToolCall({
+              callId: 'agent-pending',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: pendingDisplay,
+            }),
+          ]}
+        />,
+      );
+
+      // The subagent with pending confirmation gets focus, not the first running one
+      expect(lastFrame()).toContain(
+        'MockSubagent[agent-running]: focused=false',
+      );
+      expect(lastFrame()).toContain(
+        'MockSubagent[agent-pending]: focused=true',
+      );
+    });
+
+    it('direct tool-level confirmation blocks all subagent shortcut focus', () => {
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          toolCalls={[
+            createToolCall({
+              callId: 'tool-confirm',
+              name: 'write_file',
+              status: ToolCallStatus.Confirming,
+              confirmationDetails: {
+                type: 'info',
+                title: 'Write file?',
+                prompt: 'Allow write?',
+                onConfirm: vi.fn(),
+              },
+            }),
+            createToolCall({
+              callId: 'agent-running',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('runner'),
+            }),
+          ]}
+        />,
+      );
+
+      // Direct tool confirmation active → subagent gets no shortcut focus
+      expect(lastFrame()).toContain(
+        'MockSubagent[agent-running]: focused=false',
+      );
+    });
+
+    it('completed subagent does not receive focus', () => {
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          toolCalls={[
+            createToolCall({
+              callId: 'agent-done',
+              name: 'agent',
+              status: ToolCallStatus.Success,
+              resultDisplay: createCompletedSubagentDisplay('finished'),
+            }),
+          ]}
+        />,
+      );
+
+      expect(lastFrame()).toContain('MockSubagent[agent-done]: focused=false');
+    });
+  });
+
+  describe('Live agent grouping', () => {
+    const createRunningSubagentDisplay = (
+      name: string,
+    ): AgentResultDisplay => ({
+      type: 'task_execution',
+      subagentName: name,
+      taskDescription: `${name} task`,
+      taskPrompt: `Run ${name}`,
+      status: 'running',
+    });
+
+    it('routes contiguous live agents into a single AgentTree', () => {
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          isPending={true}
+          toolCalls={[
+            createToolCall({
+              callId: 'agent-1',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('reviewer'),
+            }),
+            createToolCall({
+              callId: 'agent-2',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('reviewer'),
+            }),
+          ]}
+        />,
+      );
+
+      const frame = lastFrame() ?? '';
+      // Both agents collapse into one tree node.
+      expect(frame).toContain('MockAgentTree[agent-1:reviewer');
+      expect(frame).toContain('agent-2:reviewer');
+      // No per-tool MockSubagent rows for live agents.
+      expect(frame).not.toContain('MockSubagent[agent-1]');
+      expect(frame).not.toContain('MockSubagent[agent-2]');
+    });
+
+    it('splits the tree when a non-agent call sits between agent calls', () => {
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          isPending={true}
+          toolCalls={[
+            createToolCall({
+              callId: 'agent-1',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('reviewer'),
+            }),
+            createToolCall({
+              callId: 'shell-1',
+              name: 'run_shell_command',
+              status: ToolCallStatus.Executing,
+            }),
+            createToolCall({
+              callId: 'agent-2',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('reviewer'),
+            }),
+          ]}
+        />,
+      );
+
+      const frame = lastFrame() ?? '';
+      // Two separate trees, one per contiguous run.
+      expect(frame).toContain('MockAgentTree[agent-1:reviewer');
+      expect(frame).toContain('MockAgentTree[agent-2:reviewer');
+      // Non-agent call still renders via the per-tool path.
+      expect(frame).toContain('MockTool[shell-1]');
+    });
+
+    it('passes focus only to the first pending-confirmation agent', () => {
+      const pendingDisplay: AgentResultDisplay = {
+        ...createRunningSubagentDisplay('reviewer'),
+        pendingConfirmation: {
+          type: 'info',
+          title: 'Approve?',
+          prompt: 'allow?',
+          onConfirm: vi.fn(),
+        },
+      };
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          isPending={true}
+          toolCalls={[
+            createToolCall({
+              callId: 'agent-running',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: createRunningSubagentDisplay('reviewer'),
+            }),
+            createToolCall({
+              callId: 'agent-pending',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: pendingDisplay,
+            }),
+          ]}
+        />,
+      );
+
+      // Frame may soft-wrap inside the group border; collapse before
+      // matching so the assertion isn't sensitive to terminal width.
+      const frame = (lastFrame() ?? '').replace(/[│\n]/g, '');
+      expect(frame).toContain('agent-pending:reviewer:focused=true');
+      expect(frame).toContain('agent-running:reviewer:focused=false');
+    });
+
+    it('queues the agent banner when a direct tool confirmation is active', () => {
+      const pendingDisplay: AgentResultDisplay = {
+        ...createRunningSubagentDisplay('reviewer'),
+        pendingConfirmation: {
+          type: 'info',
+          title: 'Approve agent action?',
+          prompt: 'allow agent action?',
+          onConfirm: vi.fn(),
+        },
+      };
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          isPending={true}
+          toolCalls={[
+            createToolCall({
+              callId: 'tool-confirm',
+              name: 'write_file',
+              status: ToolCallStatus.Confirming,
+              confirmationDetails: {
+                type: 'info',
+                title: 'Write file?',
+                prompt: 'allow write?',
+                onConfirm: vi.fn(),
+              },
+            }),
+            createToolCall({
+              callId: 'agent-pending',
+              name: 'agent',
+              status: ToolCallStatus.Executing,
+              resultDisplay: pendingDisplay,
+            }),
+          ]}
+        />,
+      );
+      // Direct tool's Confirming row keeps focus; agent banner does not
+      // light up its own focused branch even though the agent has a
+      // pending confirmation.
+      const frame = (lastFrame() ?? '').replace(/[│\n]/g, '');
+      expect(frame).toContain('agent-pending:reviewer:focused=false');
+    });
+
+    it('falls back to per-tool live rendering once the group commits', () => {
+      const completed: AgentResultDisplay = {
+        type: 'task_execution',
+        subagentName: 'reviewer',
+        taskDescription: 'reviewer task',
+        taskPrompt: 'review it',
+        status: 'completed',
+      };
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          isPending={false}
+          toolCalls={[
+            createToolCall({
+              callId: 'agent-1',
+              name: 'agent',
+              status: ToolCallStatus.Success,
+              resultDisplay: completed,
+            }),
+          ]}
+        />,
+      );
+      const frame = lastFrame() ?? '';
+      expect(frame).not.toContain('MockAgentTree');
+      expect(frame).toContain('MockSubagent[agent-1]');
+    });
+  });
+
+  describe('Border Color Logic', () => {
+    it('uses yellow border when tools are pending', () => {
+      const toolCalls = [createToolCall({ status: ToolCallStatus.Pending })];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={toolCalls} />,
+      );
+      // The snapshot will capture the visual appearance including border color
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('uses yellow border for shell commands even when successful', () => {
+      const toolCalls = [
+        createToolCall({
+          name: 'run_shell_command',
+          status: ToolCallStatus.Success,
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={toolCalls} />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+
+    it('uses gray border when all tools are successful and no shell commands', () => {
+      const toolCalls = [
+        createToolCall({ status: ToolCallStatus.Success }),
+        createToolCall({
+          callId: 'tool-2',
+          name: 'another-tool',
+          status: ToolCallStatus.Success,
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={toolCalls} />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+  });
+
+  describe('Height Calculation', () => {
+    it('calculates available height correctly with multiple tools with results', () => {
+      const toolCalls = [
+        createToolCall({
+          callId: 'tool-1',
+          resultDisplay: 'Result 1',
+        }),
+        createToolCall({
+          callId: 'tool-2',
+          resultDisplay: 'Result 2',
+        }),
+        createToolCall({
+          callId: 'tool-3',
+          resultDisplay: '', // No result
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage
+          {...baseProps}
+          toolCalls={toolCalls}
+          availableTerminalHeight={20}
+        />,
+      );
+      expect(lastFrame()).toMatchSnapshot();
+    });
+  });
+
+  describe('Confirmation Handling', () => {
+    it('shows confirmation dialog for first confirming tool only', () => {
+      const toolCalls = [
+        createToolCall({
+          callId: 'tool-1',
+          name: 'first-confirm',
+          status: ToolCallStatus.Confirming,
+          confirmationDetails: {
+            type: 'info',
+            title: 'Confirm First Tool',
+            prompt: 'Confirm first tool',
+            onConfirm: vi.fn(),
+          },
+        }),
+        createToolCall({
+          callId: 'tool-2',
+          name: 'second-confirm',
+          status: ToolCallStatus.Confirming,
+          confirmationDetails: {
+            type: 'info',
+            title: 'Confirm Second Tool',
+            prompt: 'Confirm second tool',
+            onConfirm: vi.fn(),
+          },
+        }),
+      ];
+      const { lastFrame } = renderWithProviders(
+        <ToolGroupMessage {...baseProps} toolCalls={toolCalls} />,
+      );
+      // Should only show confirmation for the first tool
+      expect(lastFrame()).toMatchSnapshot();
+    });
+  });
+});
