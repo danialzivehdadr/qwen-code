@@ -75,10 +75,10 @@
     "@typescript-eslint/parser": "^7.13.0",
     "@vitest/coverage-v8": "^1.6.0",
     "dts-bundle-generator": "^9.5.1",
-    "esbuild": "^0.25.12",
+    "esbuild": "^0.28.1",
     "eslint": "^8.57.0",
     "typescript": "^5.4.5",
-    "vitest": "^1.6.0"
+    "vitest": "^3.2.6"
   },
   "peerDependencies": {
     "typescript": ">=5.0.0"
