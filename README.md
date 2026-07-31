@@ -1,5 +1,5 @@
 <div align="center">
-
+contracts-logistics-forecast-autodedelde
 [![npm version](https://img.shields.io/npm/v/@qwen-code/qwen-code.svg)](https://www.npmjs.com/package/@qwen-code/qwen-code)
 [![License](https://img.shields.io/github/license/QwenLM/qwen-code.svg)](./LICENSE)
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen.svg)](https://nodejs.org/)
