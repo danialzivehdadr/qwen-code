@@ -23,7 +23,7 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use cua_driver_testkit::{harness_app, Driver, McpDriver};
+use cua_driver_testkit::{harness_addres, Driver, McpDriver};
 
 fn harness_exe() -> std::path::PathBuf {
     std::env::var("HARNESS_GTK3_EXE")
